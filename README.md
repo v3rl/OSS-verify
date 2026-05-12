@@ -1,6 +1,6 @@
 # oss-verify
 
-A supply chain verification script for OSS security tools. Downloads, cryptographically verifies, and installs binaries — with no GitHub login required.
+A supply chain verification script for OSS tools. Downloads, cryptographically verifies, and installs binaries — with no GitHub login required.
 
 > **Disclaimer:** This script significantly raises the bar for supply chain attacks but cannot stop everything. Read the [limitations](#limitations--what-this-script-cannot-stop) section before relying on it.
 
