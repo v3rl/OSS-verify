@@ -329,13 +329,106 @@ Check releases manually before upgrading:
 
 ## Adding a new tool
 
-Add a block to the `register_tools()` function in `oss-verify.sh`:
+Adding support for a new tool is a five-step process. Take your time on steps 1 and 2 — getting the signing pattern and identity wrong means verification silently passes when it shouldn't.
+
+### Step 1 — Find out if the tool uses cosign
+
+Go to the tool's GitHub releases page and look at the assets for a recent release. You are looking for any of:
+
+| File pattern | Means |
+|---|---|
+| `<binary>.sigstore.json` | Pattern A — direct bundle |
+| `checksums.txt` + `checksums.txt.pem` + `checksums.txt.sig` | Pattern B — checksums + cert/sig |
+| `checksums.txt` + `checksums.txt.sigstore.json` | Pattern C — checksums + bundle |
+| `checksums.txt` only, no signing files | Pattern D — no cosign |
+
+If none of these match, check the tool's README or INSTALL docs — some tools use different naming conventions.
+
+### Step 2 — Find the signing identity
+
+The identity is the GitHub Actions workflow URL that cosign will accept. Getting this wrong is a security issue — too broad and you accept signatures from any workflow in the repo; too narrow and legitimate releases fail verification.
+
+**From a `.pem` file (Pattern B):**
 
 ```bash
-# ── mytool (Pattern A: direct bundle) ─────────────────────────────────────────
-TOOL_DESCRIPTION[mytool]="My tool description"
+# Download the .pem from the releases page, then:
+openssl x509 -in checksums.txt.pem -noout -text | grep URI
+```
+
+Look for a line like:
+```
+URI:https://github.com/org/tool/.github/workflows/release.yaml@refs/tags/v1.2.3
+```
+
+**From a `.sigstore.json` bundle (Pattern A or C):**
+
+```bash
+jq -r '.verificationMaterial.certificate.rawBytes' bundle.sigstore.json \
+  | base64 -d | openssl x509 -noout -text | grep URI
+```
+
+**Decide: exact identity or regexp?**
+
+- Use an **exact identity** (`TOOL_IDENTITY_EXACT`) when the workflow file is always the same and includes the version tag, e.g.:
+  `https://github.com/org/tool/.github/workflows/release.yaml@refs/tags/v{VERSION}`
+
+- Use a **regexp identity** (`TOOL_IDENTITY_REGEXP`) when the workflow path varies or you want to accept any workflow under `.github/workflows/`, e.g.:
+  `https://github\.com/org/tool/\.github/workflows/.+`
+
+The regexp is more permissive. Prefer the exact identity where possible — it pins to a specific workflow file, making it harder for an attacker who only compromises one workflow to pass verification.
+
+### Step 3 — Build the URL template
+
+Look at the download URL for the binary on the releases page. Replace the version, OS, and arch with template variables:
+
+```
+# Actual URL:
+https://github.com/org/tool/releases/download/v1.2.3/tool_1.2.3_linux_amd64.tar.gz
+
+# Template:
+https://github.com/org/tool/releases/download/v{VERSION}/tool_{VERSION}_{OS}_{ARCH}.tar.gz
+```
+
+The script resolves `{VERSION}`, `{OS}` (linux/darwin), and `{ARCH}` (amd64/arm64) automatically.
+
+Check that the tool uses the same naming on macOS — some use `darwin`, some use `macos`. If naming differs by platform you may need to add a custom resolution case in `resolve_url()`.
+
+### Step 4 — Add the profile block
+
+Add a block to the `register_tools()` function in `oss-verify.sh`. Choose the template that matches your pattern:
+
+**Pattern A — direct bundle:**
+```bash
+TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
 TOOL_PATTERN[mytool]="direct_bundle"
 TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
+TOOL_BUNDLE_SUFFIX[mytool]=".sigstore.json"
+TOOL_BINARY_NAME[mytool]="mytool"
+TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"        # filename inside the tarball
+TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/.+'
+TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
+```
+
+**Pattern B — checksums + cert/sig:**
+```bash
+TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
+TOOL_PATTERN[mytool]="checksum_certsig"
+TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
+TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
+TOOL_CERT_SUFFIX[mytool]=".pem"
+TOOL_SIG_SUFFIX[mytool]=".sig"
+TOOL_BINARY_NAME[mytool]="mytool"
+TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
+TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/.+'
+TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
+```
+
+**Pattern C — checksums + bundle:**
+```bash
+TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
+TOOL_PATTERN[mytool]="checksum_bundle"
+TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
+TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
 TOOL_BUNDLE_SUFFIX[mytool]=".sigstore.json"
 TOOL_BINARY_NAME[mytool]="mytool"
 TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
@@ -343,16 +436,58 @@ TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/
 TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
 ```
 
-To find the correct `TOOL_IDENTITY_REGEXP`, inspect the signing certificate from a known-good release:
+**Pattern D — checksums only (no cosign):**
+```bash
+TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
+TOOL_PATTERN[mytool]="checksum_only"
+TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
+TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
+TOOL_BINARY_NAME[mytool]="mytool"
+TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
+```
+
+**If the binary is not inside a tarball** (raw binary download, like cosign itself), set `TOOL_BINARY_IN_ARCHIVE` to empty:
+```bash
+TOOL_BINARY_IN_ARCHIVE[mytool]=""
+```
+
+**If the tool uses an exact identity** (version-pinned workflow URL), use `TOOL_IDENTITY_EXACT` instead of `TOOL_IDENTITY_REGEXP`:
+```bash
+TOOL_IDENTITY_EXACT[mytool]="https://github.com/org/mytool/.github/workflows/release.yaml@refs/tags/v{VERSION}"
+```
+
+### Step 5 — Test it
+
+Always test against a known-good version before relying on it:
 
 ```bash
-# From a .pem file
-openssl x509 -in checksums.txt.pem -noout -text | grep URI
+# Verify only first — don't install until you're confident
+./oss-verify.sh --tool mytool --version 1.2.3 --no-install
 
-# From a .sigstore.json bundle
-jq -r '.verificationMaterial.certificate.rawBytes' bundle.sigstore.json \
-  | base64 -d | openssl x509 -noout -text | grep URI
+# Check the lockfile was written correctly
+cat ~/.local/share/oss-verify/mytool-1.2.3-linux-amd64.lock
+
+# Run again to confirm lockfile comparison passes
+./oss-verify.sh --tool mytool --version 1.2.3 --no-install
+
+# Test that a tampered binary is rejected
+# (copy the lockfile, change the binary hash manually, confirm abort)
+
+# Install for real
+./oss-verify.sh --tool mytool --version 1.2.3
 ```
+
+Also verify that cosign would have caught a bad identity by temporarily changing `TOOL_IDENTITY_REGEXP` to something that won't match and confirming it fails.
+
+### Common issues
+
+**Download 404** — the URL template doesn't match the actual release filename. Check the releases page carefully; some tools use `Linux` (capital L), `x86_64` instead of `amd64`, or different separators.
+
+**cosign identity mismatch** — the identity you extracted from the cert doesn't match what you put in the profile. Re-run the `openssl` command above and copy the URI exactly.
+
+**sha256sum fails** — the checksums file uses a different format or only covers some platforms. Open the file and check whether the binary filename is listed. Some tools only include certain platforms in their checksums.
+
+**Binary not found in archive** — after `tar -xzf`, the binary might be in a subdirectory or have a different name. Run `tar -tzf <tarball>` to list the archive contents and update `TOOL_BINARY_IN_ARCHIVE` accordingly.
 
 ---
 
