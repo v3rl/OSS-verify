@@ -1,45 +1,43 @@
 # oss-verify
 
-A supply chain verification script for OSS tools. Downloads, cryptographically verifies, and installs binaries — with no GitHub login required.
+A supply chain verification script for any OSS tool hosted on GitHub. Downloads, cryptographically verifies, and installs binaries.
 
 > **Disclaimer:** This script significantly raises the bar for supply chain attacks but cannot stop everything. Read the [limitations](#limitations--what-this-script-cannot-stop) section before relying on it.
 
 ---
 
-## The problem it solves
-
-When you `curl | bash` or download a binary from a release page, you are trusting:
-
-- The release page hasn't been tampered with
-- The binary is what the maintainers actually built
-- Nobody has swapped it since it was signed
-
-SHA256 checksums alone don't help — an attacker who controls the release page can update both the binary and the checksum. You need **provenance verification**, not just integrity verification.
-
----
-
 ## How it works
 
-The script uses [cosign](https://github.com/sigstore/cosign) to verify that a binary was produced by a specific, named GitHub Actions workflow and recorded in the [Rekor](https://rekor.sigstore.dev) public transparency log — an append-only, externally operated audit log that cannot be quietly modified.
+The script fetches the release asset list from the GitHub API, auto-detects the signing pattern used by the project, then uses [cosign](https://github.com/sigstore/cosign) to verify that the binary was produced by a specific, named GitHub Actions workflow and recorded in the [Rekor](https://rekor.sigstore.dev) public transparency log — an append-only, externally operated audit log that cannot be quietly modified.
 
-After verification it writes a **lockfile** pinning the exact hashes and signing timestamp it saw. Future installs of the same version must match the lockfile exactly.
+After verification it writes a **lockfile** pinning the exact hashes and signing timestamp. Future installs of the same version must match the lockfile exactly.
 
 ```
-Download binary + signing files
+Fetch release asset list from GitHub API
+        ↓
+Auto-detect binary asset for your OS/arch
+        ↓
+Auto-detect signing pattern (A, B, C, or D)
         ↓
 cosign verify-blob
   → checks signature is valid
-  → checks identity matches the tool's CI workflow
+  → checks identity matches the tool's CI workflow (extracted from the cert/bundle)
   → checks Rekor transparency log entry exists
+  → both attempts pin the OIDC issuer — no issuer-free fallback
+        ↓
+Timestamp extraction (from Rekor entry or signing certificate)
         ↓
 Timestamp check (optional --cutoff)
   → rejects if signed after a known compromise date
+  → cutoff validated as strict YYYY-MM-DD before use
         ↓
 Lockfile check
-  → first run: writes pinned hashes
-  → subsequent runs: compares against pinned hashes
+  → first run: writes pinned hashes + signing epoch
+  → subsequent runs: verifies ownership, compares all pinned values
         ↓
-Install
+Archive path traversal scan (before extraction)
+        ↓
+Install (symlink-safe extraction, path escape check)
 ```
 
 ---
@@ -73,10 +71,10 @@ No purely technical verification step can save you here on a first install of a 
 ### The `--cutoff` flag helps — but only after you know
 
 ```bash
-./oss-verify.sh --tool trivy --version 0.69.4 --cutoff 2026-03-18
+./oss-verify.sh --repo aquasecurity/trivy --version 0.69.4 --cutoff 2026-03-18
 ```
 
-This rejects v0.69.4 because it was signed after the cutoff. But you have to already know the compromise date to set the flag. It is useful for:
+This rejects v0.69.4 because it was signed after the cutoff. But you have to already know the compromise date to set the flag. The cutoff date must be strictly `YYYY-MM-DD` — relative strings like `"yesterday"` are rejected. It is useful for:
 
 - Reinstalling a version you know is safe
 - Enforcing a known-good window across your team after an incident is disclosed
@@ -91,23 +89,7 @@ It does nothing for v0.69.4 which was never in your lockfile.
 
 ---
 
-## What actually protects you against CI credential compromise
-
-These are **human processes**, not automated tooling:
-
-1. **Never install on release day.** Wait a few days. The community detects compromised releases quickly. Aqua's incident was publicly disclosed within hours.
-
-2. **Subscribe to security advisories** for every tool you depend on. GitHub → Watch → Security alerts.
-
-3. **Pin deliberately after reading the release notes.** Review what changed before upgrading. A release with unexpected binary size changes or unusual changelog entries is a warning sign.
-
-4. **Don't auto-upgrade in CI.** Pinning `--version latest` in any form, even via a script, means you install whatever the attacker published.
-
-5. **Use the lockfile + cutoff after an incident is disclosed.** Once a compromise window is known, `--cutoff` lets you enforce that boundary across your team.
-
----
-
-## What the script is genuinely good for
+## What the script is good for
 
 - **Binary swapped without re-signing.** An attacker who can modify a release page but doesn't have CI credentials cannot produce a valid cosign signature. The script catches this reliably.
 
@@ -116,6 +98,8 @@ These are **human processes**, not automated tooling:
 - **Team consistency.** Commit the lockfile to your repo and every developer and CI run installs the exact binary you personally reviewed.
 
 - **Post-incident recovery.** After a compromise is disclosed, `--cutoff` lets you verify that the version you have predates the attack window.
+
+- **No hardcoded tool list.** Any public GitHub repo that signs its releases with cosign works automatically — no registration or profile required.
 
 - **Removing the grunt work.** Manually running cosign, extracting timestamps, and managing hashes is tedious. This script automates the mechanical parts of a process you should be doing anyway.
 
@@ -127,14 +111,15 @@ These are **human processes**, not automated tooling:
 cosign      # https://github.com/sigstore/cosign/releases
 curl
 jq
-sha256sum
-openssl
+openssl     # used for identity extraction and timestamp parsing
+sha256sum   # or shasum on macOS; busybox sha256sum also supported
+bash 4+     # macOS ships bash 3.2 — script auto-detects and re-execs with Homebrew bash
 ```
 
-Install cosign itself using the script (it signs itself, so no chicken-and-egg problem):
-
+Optional:
 ```bash
-./oss-verify.sh --tool cosign --version 2.4.1
+zstd        # only needed if the tool ships .tar.zst archives
+unzip       # only needed if the tool ships .zip archives
 ```
 
 ---
@@ -144,17 +129,26 @@ Install cosign itself using the script (it signs itself, so no chicken-and-egg p
 ```bash
 chmod +x oss-verify.sh
 
-# See all supported tools
-./oss-verify.sh --list
+# Install Trivy
+./oss-verify.sh --repo aquasecurity/trivy --version 0.70.0
 
 # Install TruffleHog
-./oss-verify.sh --tool trufflehog --version 3.95.3
+./oss-verify.sh --repo trufflesecurity/trufflehog --version 3.95.3
 
-# Install Trivy with a trust cutoff
-./oss-verify.sh --tool trivy --version 0.70.0 --cutoff 2026-03-01
+# Install Grype with a trust cutoff
+./oss-verify.sh --repo anchore/grype --version 0.112.0 --cutoff 2026-03-01
+
+# Install gh CLI (binary name differs from repo name)
+./oss-verify.sh --repo cli/cli --binary gh --version 2.49.0
 
 # Verify only, do not install
-./oss-verify.sh --tool grype --version 0.88.0 --no-install
+./oss-verify.sh --repo anchore/syft --version 1.19.0 --no-install
+
+# See what the script would do without downloading anything
+./oss-verify.sh --repo aquasecurity/trivy --version 0.70.0 --dry-run
+
+# Show detailed detection steps
+./oss-verify.sh --repo anchore/grype --version 0.112.0 --verbose
 ```
 
 Add `~/.local/bin` to your PATH if not already:
@@ -169,95 +163,99 @@ export PATH="$HOME/.local/bin:$PATH"
 
 | Flag | Description |
 |---|---|
-| `--tool <name>` | Tool to install (required) |
-| `--version <x.y.z>` | Exact version (required — no auto-fetch) |
-| `--cutoff <YYYY-MM-DD>` | Reject binaries signed after this date |
-| `--lock-dir <path>` | Override lockfile directory |
+| `--repo <owner/repo>` | GitHub repository in `owner/repo` format (required) |
+| `--version <x.y.z>` | Exact version to install (required — no auto-fetch by design) |
+| `--binary <name>` | Binary name if it differs from the repo name (e.g. `gh` for `cli/cli`) |
+| `--cutoff <YYYY-MM-DD>` | Reject binaries signed after this date — must be strict ISO date |
+| `--lock-dir <path>` | Override lockfile directory — must be absolute, non-system path |
 | `--install-dir <path>` | Override install directory (default: `~/.local/bin`) |
 | `--no-install` | Verify only, skip install |
-| `--list` | List all supported tools |
+| `--dry-run` | Print detected pattern and asset URLs, then exit without downloading |
+| `--verbose` | Show detailed detection steps including cert parsing diagnostics |
 | `--help` | Show usage |
 
 ### Environment variables
 
 | Variable | Description |
 |---|---|
-| `OSS_VERIFY_LOCK_DIR` | Default lockfile directory (overridden by `--lock-dir`) |
+| `OSS_VERIFY_LOCK_DIR` | Default lockfile directory |
 
 ---
 
-## Supported tools
+## Signing patterns (auto-detected)
 
-| Tool | Description | Signing pattern |
-|---|---|---|
-| `trufflehog` | Secret scanner by TruffleSecurity | B — checksums + cert/sig |
-| `trivy` | Vulnerability scanner by Aqua Security | A — direct bundle |
-| `cosign` | Sigstore signing tool | A — direct bundle |
-| `grype` | Vulnerability scanner by Anchore | C — checksums + bundle |
-| `syft` | SBOM generator by Anchore | C — checksums + bundle |
-| `crane` | OCI registry tool by Google | B — checksums + cert/sig |
-
----
-
-## Signing patterns
-
-Different projects sign their releases in different ways. The script handles all of them transparently.
+The script inspects the release assets and automatically determines which signing pattern the project uses. No configuration needed.
 
 ### Pattern A — Direct bundle
 Used by: **Trivy**, **cosign**
 
-cosign signs the tarball itself. One verification step.
+cosign signs the binary tarball directly via a `.sigstore.json` bundle. One verification step. The bundle contains the Rekor transparency log entry including the `integratedTime` timestamp, which is used for lockfile pinning and `--cutoff` enforcement.
 
 ```
-cosign verify-blob <binary.tar.gz> \
-  --bundle <binary.tar.gz>.sigstore.json \
-  --certificate-identity <workflow URL> \
+cosign verify-blob <binary.tar.gz>
+  --bundle <binary.tar.gz>.sigstore.json
+  --certificate-identity <extracted from bundle>
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Lockfile pins: binary SHA256, bundle SHA256, signing timestamp.
+Timestamp source: `integratedTime` from the Rekor entry inside the bundle.
+Lockfile pins: binary SHA256, bundle SHA256, signing epoch.
 
 ### Pattern B — Checksums + certificate + signature
-Used by: **TruffleHog**, **crane**
+Used by: **TruffleHog**, **crane**, **Grype**
 
-cosign signs a `checksums.txt` file (not the binary directly). Two steps: cosign verifies the checksums file, then `sha256sum` verifies the binary against it.
+cosign signs a `checksums.txt` file (not the binary directly). Two steps: cosign verifies the checksums file, then `sha256sum` verifies the binary against it. The signing certificate is a short-lived Fulcio-issued cert valid for ~10 minutes around the time of signing.
 
 ```
-# Step 1: verify the checksums file
-cosign verify-blob checksums.txt \
-  --certificate checksums.txt.pem \
-  --signature   checksums.txt.sig \
-  --certificate-identity-regexp <workflow regexp> \
+# Step 1
+cosign verify-blob checksums.txt
+  --certificate checksums.txt.pem
+  --signature   checksums.txt.sig
+  --certificate-identity <extracted from .pem>
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# Step 2: verify the binary
+# Step 2
 sha256sum --ignore-missing -c checksums.txt
 ```
 
-Lockfile pins: binary SHA256, checksums SHA256, certificate SHA256, signing timestamp.
+Timestamp source: `notBefore` from the signing certificate's validity window.
+Lockfile pins: binary SHA256, checksums SHA256, certificate SHA256, signing epoch.
 
 ### Pattern C — Checksums + sigstore bundle
-Used by: **Grype**, **Syft**
+Used by: **Syft**
 
-Same two-step chain as Pattern B, but uses a `.sigstore.json` bundle instead of separate `.pem` and `.sig` files.
+Same two-step chain as Pattern B but uses a `.sigstore.json` bundle instead of separate `.pem` and `.sig` files. The bundle contains a Rekor entry with an `integratedTime` timestamp.
 
-```
-# Step 1: verify the checksums file
-cosign verify-blob checksums.txt \
-  --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp <workflow regexp> \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-
-# Step 2: verify the binary
-sha256sum --ignore-missing -c checksums.txt
-```
-
-Lockfile pins: binary SHA256, checksums SHA256, bundle SHA256, signing timestamp.
+Timestamp source: `integratedTime` from the Rekor entry inside the bundle.
+Lockfile pins: binary SHA256, checksums SHA256, bundle SHA256, signing epoch.
 
 ### Pattern D — Checksums only (no cosign)
 Fallback for tools that don't yet support cosign.
 
-SHA256 only — verifies **integrity** (file wasn't corrupted) but not **provenance** (who built it). The script warns clearly when this pattern is used.
+SHA256 only — verifies **integrity** (file wasn't corrupted) but not **provenance** (who built it). The script warns clearly when this pattern is used and refuses to proceed if `--cutoff` is set since there is no signing timestamp available to enforce it.
+
+---
+
+## Timestamp extraction
+
+Timestamps are used for two purposes: writing a meaningful signing date to the lockfile, and enforcing `--cutoff` rejection.
+
+The source depends on the signing pattern:
+
+**Patterns A and C (sigstore bundle)** — the bundle contains a `verificationMaterial.tlogEntries[0].integratedTime` field written by the Rekor transparency log at the moment of signing. This is the most authoritative timestamp — it comes from infrastructure outside the project's control and cannot be backdated.
+
+**Pattern B (certificate + signature)** — the `.pem` file is a short-lived X.509 certificate issued by Fulcio. The `notBefore` field reflects when Fulcio issued the cert, which happens within seconds of the GitHub Actions OIDC token being presented during signing. The script extracts this using two strategies:
+
+- **Strategy A:** `openssl x509 -startdate` — works for standard PEM certificates.
+- **Strategy B:** `openssl asn1parse` — used when `openssl x509` refuses to parse the cert. This occurs with some Fulcio intermediate CA chains (e.g. Grype uses ECDSA P-384 certs that OpenSSL 3.0 rejects at the `x509` level). `asn1parse` reads the raw ASN.1 structure directly and extracts the `UTCTIME` or `GENERALIZEDTIME` field.
+
+### On the security of asn1parse for timestamp extraction
+
+`asn1parse` does not validate the certificate chain — it reads raw bytes. This is intentional and safe in this context for the following reason: `asn1parse` is only ever called **after cosign has already verified the certificate**. cosign uses Sigstore's own trust roots (not the system OpenSSL trust store) to validate the full Fulcio chain, the Rekor entry, and the signature. OpenSSL refusing to parse the cert via `openssl x509` is an OpenSSL version compatibility issue, not a trust issue.
+
+The security model is: cosign validates the cert → we trust the cert → we use `asn1parse` only to read a date field from an already-trusted artifact. We are not using `asn1parse` to make any trust decision.
+
+The `notBefore` date on a Fulcio-issued cert cannot be backdated by an attacker. It reflects when Fulcio's CA issued the cert in response to a valid GitHub Actions OIDC token. An attacker with compromised CI credentials could trigger a real signing event — but the resulting cert's `notBefore` would accurately reflect when that signing happened, not an earlier date.
 
 ---
 
@@ -266,30 +264,38 @@ SHA256 only — verifies **integrity** (file wasn't corrupted) but not **provena
 On first install the script writes a lockfile:
 
 ```
-~/.local/share/oss-verify/trufflehog-3.95.3-linux-amd64.lock
+~/.local/share/oss-verify/trivy-0.70.0-linux-amd64.lock
 ```
 
 ```json
 {
-  "version": "3.95.3",
+  "repo": "aquasecurity/trivy",
+  "version": "0.70.0",
+  "os_arch": "linux/amd64",
+  "pattern": "direct_bundle",
   "signing_epoch": "1746000000",
   "signing_date": "2026-04-30 12:00:00 UTC",
-  "pattern": "checksum_certsig",
+  "identity": "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.70.0",
   "binary_sha256": "abc123...",
-  "checksums_sha256": "def456...",
-  "cert_sha256": "ghi789..."
+  "bundle_sha256": "def456..."
 }
 ```
 
-On subsequent installs of the same version, every value is compared against the lockfile. If anything differs — the binary, the checksums file, the certificate, or the signing timestamp — the install is aborted.
+On subsequent installs of the same version, the script:
+
+1. Checks the lockfile is owned by the current user — detects pre-planted lockfile attacks where another user writes a forged lockfile before your first install
+2. Compares the signing epoch — any difference aborts
+3. Compares every SHA256 hash — any difference aborts
+
+If anything differs the install is refused and you are told to investigate before proceeding.
 
 ### Sharing lockfiles across a team
 
-Commit the lockfile to your repository. Every developer and CI run will verify against the binary you personally reviewed.
+Commit the lockfile to your repository. Every developer and CI run will verify against the binary you personally reviewed on day one.
 
 ```bash
 # Developer machine — first install
-./oss-verify.sh --tool trufflehog --version 3.95.3 \
+./oss-verify.sh --repo trufflesecurity/trufflehog --version 3.95.3 \
   --lock-dir ./lockfiles
 
 # Commit the lockfile
@@ -297,15 +303,8 @@ git add lockfiles/trufflehog-3.95.3-linux-amd64.lock
 git commit -m "pin trufflehog 3.95.3"
 
 # CI — uses the committed lockfile
-./oss-verify.sh --tool trufflehog --version 3.95.3 \
-  --lock-dir ./lockfiles
-```
-
-Or via environment variable:
-
-```bash
-export OSS_VERIFY_LOCK_DIR="$(pwd)/lockfiles"
-./oss-verify.sh --tool trufflehog --version 3.95.3
+OSS_VERIFY_LOCK_DIR=./lockfiles \
+  ./oss-verify.sh --repo trufflesecurity/trufflehog --version 3.95.3
 ```
 
 ---
@@ -327,177 +326,13 @@ Check releases manually before upgrading:
 
 ---
 
-## Adding a new tool
-
-Adding support for a new tool is a five-step process. Take your time on steps 1 and 2 — getting the signing pattern and identity wrong means verification silently passes when it shouldn't.
-
-### Step 1 — Find out if the tool uses cosign
-
-Go to the tool's GitHub releases page and look at the assets for a recent release. You are looking for any of:
-
-| File pattern | Means |
-|---|---|
-| `<binary>.sigstore.json` | Pattern A — direct bundle |
-| `checksums.txt` + `checksums.txt.pem` + `checksums.txt.sig` | Pattern B — checksums + cert/sig |
-| `checksums.txt` + `checksums.txt.sigstore.json` | Pattern C — checksums + bundle |
-| `checksums.txt` only, no signing files | Pattern D — no cosign |
-
-If none of these match, check the tool's README or INSTALL docs — some tools use different naming conventions.
-
-### Step 2 — Find the signing identity
-
-The identity is the GitHub Actions workflow URL that cosign will accept. Getting this wrong is a security issue — too broad and you accept signatures from any workflow in the repo; too narrow and legitimate releases fail verification.
-
-**From a `.pem` file (Pattern B):**
-
-```bash
-# Download the .pem from the releases page, then:
-openssl x509 -in checksums.txt.pem -noout -text | grep URI
-```
-
-Look for a line like:
-```
-URI:https://github.com/org/tool/.github/workflows/release.yaml@refs/tags/v1.2.3
-```
-
-**From a `.sigstore.json` bundle (Pattern A or C):**
-
-```bash
-jq -r '.verificationMaterial.certificate.rawBytes' bundle.sigstore.json \
-  | base64 -d | openssl x509 -noout -text | grep URI
-```
-
-**Decide: exact identity or regexp?**
-
-- Use an **exact identity** (`TOOL_IDENTITY_EXACT`) when the workflow file is always the same and includes the version tag, e.g.:
-  `https://github.com/org/tool/.github/workflows/release.yaml@refs/tags/v{VERSION}`
-
-- Use a **regexp identity** (`TOOL_IDENTITY_REGEXP`) when the workflow path varies or you want to accept any workflow under `.github/workflows/`, e.g.:
-  `https://github\.com/org/tool/\.github/workflows/.+`
-
-The regexp is more permissive. Prefer the exact identity where possible — it pins to a specific workflow file, making it harder for an attacker who only compromises one workflow to pass verification.
-
-### Step 3 — Build the URL template
-
-Look at the download URL for the binary on the releases page. Replace the version, OS, and arch with template variables:
-
-```
-# Actual URL:
-https://github.com/org/tool/releases/download/v1.2.3/tool_1.2.3_linux_amd64.tar.gz
-
-# Template:
-https://github.com/org/tool/releases/download/v{VERSION}/tool_{VERSION}_{OS}_{ARCH}.tar.gz
-```
-
-The script resolves `{VERSION}`, `{OS}` (linux/darwin), and `{ARCH}` (amd64/arm64) automatically.
-
-Check that the tool uses the same naming on macOS — some use `darwin`, some use `macos`. If naming differs by platform you may need to add a custom resolution case in `resolve_url()`.
-
-### Step 4 — Add the profile block
-
-Add a block to the `register_tools()` function in `oss-verify.sh`. Choose the template that matches your pattern:
-
-**Pattern A — direct bundle:**
-```bash
-TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
-TOOL_PATTERN[mytool]="direct_bundle"
-TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
-TOOL_BUNDLE_SUFFIX[mytool]=".sigstore.json"
-TOOL_BINARY_NAME[mytool]="mytool"
-TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"        # filename inside the tarball
-TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/.+'
-TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
-```
-
-**Pattern B — checksums + cert/sig:**
-```bash
-TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
-TOOL_PATTERN[mytool]="checksum_certsig"
-TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
-TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
-TOOL_CERT_SUFFIX[mytool]=".pem"
-TOOL_SIG_SUFFIX[mytool]=".sig"
-TOOL_BINARY_NAME[mytool]="mytool"
-TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
-TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/.+'
-TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
-```
-
-**Pattern C — checksums + bundle:**
-```bash
-TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
-TOOL_PATTERN[mytool]="checksum_bundle"
-TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
-TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
-TOOL_BUNDLE_SUFFIX[mytool]=".sigstore.json"
-TOOL_BINARY_NAME[mytool]="mytool"
-TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
-TOOL_IDENTITY_REGEXP[mytool]='https://github\.com/org/mytool/\.github/workflows/.+'
-TOOL_OIDC_ISSUER[mytool]="https://token.actions.githubusercontent.com"
-```
-
-**Pattern D — checksums only (no cosign):**
-```bash
-TOOL_DESCRIPTION[mytool]="Short description of what mytool does"
-TOOL_PATTERN[mytool]="checksum_only"
-TOOL_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_{OS}_{ARCH}.tar.gz"
-TOOL_CHECKSUMS_URL[mytool]="https://github.com/org/mytool/releases/download/v{VERSION}/mytool_{VERSION}_checksums.txt"
-TOOL_BINARY_NAME[mytool]="mytool"
-TOOL_BINARY_IN_ARCHIVE[mytool]="mytool"
-```
-
-**If the binary is not inside a tarball** (raw binary download, like cosign itself), set `TOOL_BINARY_IN_ARCHIVE` to empty:
-```bash
-TOOL_BINARY_IN_ARCHIVE[mytool]=""
-```
-
-**If the tool uses an exact identity** (version-pinned workflow URL), use `TOOL_IDENTITY_EXACT` instead of `TOOL_IDENTITY_REGEXP`:
-```bash
-TOOL_IDENTITY_EXACT[mytool]="https://github.com/org/mytool/.github/workflows/release.yaml@refs/tags/v{VERSION}"
-```
-
-### Step 5 — Test it
-
-Always test against a known-good version before relying on it:
-
-```bash
-# Verify only first — don't install until you're confident
-./oss-verify.sh --tool mytool --version 1.2.3 --no-install
-
-# Check the lockfile was written correctly
-cat ~/.local/share/oss-verify/mytool-1.2.3-linux-amd64.lock
-
-# Run again to confirm lockfile comparison passes
-./oss-verify.sh --tool mytool --version 1.2.3 --no-install
-
-# Test that a tampered binary is rejected
-# (copy the lockfile, change the binary hash manually, confirm abort)
-
-# Install for real
-./oss-verify.sh --tool mytool --version 1.2.3
-```
-
-Also verify that cosign would have caught a bad identity by temporarily changing `TOOL_IDENTITY_REGEXP` to something that won't match and confirming it fails.
-
-### Common issues
-
-**Download 404** — the URL template doesn't match the actual release filename. Check the releases page carefully; some tools use `Linux` (capital L), `x86_64` instead of `amd64`, or different separators.
-
-**cosign identity mismatch** — the identity you extracted from the cert doesn't match what you put in the profile. Re-run the `openssl` command above and copy the URI exactly.
-
-**sha256sum fails** — the checksums file uses a different format or only covers some platforms. Open the file and check whether the binary filename is listed. Some tools only include certain platforms in their checksums.
-
-**Binary not found in archive** — after `tar -xzf`, the binary might be in a subdirectory or have a different name. Run `tar -tzf <tarball>` to list the archive contents and update `TOOL_BINARY_IN_ARCHIVE` accordingly.
-
----
-
 ## What cosign actually checks
 
 When cosign verifies a blob it confirms:
 
 1. The cryptographic signature over the file is valid
 2. The signing certificate was issued by Fulcio (Sigstore's CA) to a GitHub Actions OIDC identity
-3. The certificate identity matches the workflow URL you specified
+3. The certificate identity matches the workflow URL extracted from the cert
 4. The Rekor transparency log contains an entry for this signing event
 5. The signing timestamp falls within the certificate's validity window
 
