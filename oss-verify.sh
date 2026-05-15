@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # oss-verify.sh — Auto-detecting supply chain verification for any OSS tool on GitHub
 
+
+
 # ── Require bash 4+ ───────────────────────────────────────────────────────────
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
@@ -13,6 +15,67 @@ if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
 fi
 
 set -euo pipefail
+
+# ── Early --help exit (before dependency checks) ──────────────────────────────
+# Must be defined here so --help works even when cosign/jq are not installed
+usage() {
+  cat << 'END_USAGE'
+oss-verify — Supply chain verification for any OSS tool on GitHub
+
+Fetches release assets, auto-detects the signing pattern, verifies with cosign,
+and pins all hashes to a lockfile. Works with any public GitHub repo that signs
+releases with Sigstore. No hardcoded tool list. No GitHub login required.
+
+USAGE
+  ./oss-verify.sh --repo <owner/repo> --version <x.y.z> [OPTIONS]
+
+OPTIONS
+  --repo        GitHub repo in owner/repo format (required)
+                  e.g. aquasecurity/trivy
+  --version     Exact version to install, e.g. 0.70.0 (required)
+                  No auto-fetch by design — pin an explicit reviewed version
+  --binary      Binary name if it differs from the repo name
+                  e.g. --binary gh for repo cli/cli
+  --cutoff      Reject if signed after this date (YYYY-MM-DD)
+                  e.g. --cutoff 2026-03-18 to enforce a pre-compromise window
+  --lock-dir    Lockfile directory (default: ~/.local/share/oss-verify)
+                  Override with OSS_VERIFY_LOCK_DIR env var
+  --install-dir Install directory (default: ~/.local/bin)
+  --no-install  Verify only — download and check but do not install
+  --dry-run     Print detected pattern and asset URLs then exit
+  --verbose     Show detailed detection and certificate parsing steps
+  --help        Show this message
+
+SIGNING PATTERNS (auto-detected from release assets)
+  A  direct_bundle    binary.sigstore.json
+                        cosign verifies the tarball directly
+  B  checksum_certsig checksums.txt + .pem + .sig
+                        cosign verifies checksums, sha256sum verifies binary
+  C  checksum_bundle  checksums.txt + .sigstore.json
+                        same two-step chain, bundle format
+  D  checksum_only    checksums.txt only
+                        SHA256 integrity only — no provenance (warns)
+
+EXAMPLES
+  ./oss-verify.sh --repo aquasecurity/trivy --version 0.70.0
+  ./oss-verify.sh --repo trufflesecurity/trufflehog --version 3.95.3
+  ./oss-verify.sh --repo anchore/grype --version 0.112.0 --cutoff 2026-03-01
+  ./oss-verify.sh --repo cli/cli --binary gh --version 2.49.0
+  ./oss-verify.sh --repo aquasecurity/trivy --version 0.70.0 --dry-run
+  ./oss-verify.sh --repo anchore/syft --version 1.19.0 --no-install
+
+LIMITATION
+  Cannot protect against an attacker with live CI credentials publishing a
+  fresh signed release — cosign passes because the signature is legitimate.
+  The lockfile protects re-installs of previously verified versions.
+  Human process (monitoring advisories, not auto-upgrading) is the last line
+  of defence. See README for the full threat model.
+END_USAGE
+}
+
+for arg in "$@"; do
+  [[ "$arg" == "--help" || "$arg" == "-h" ]] && { usage; exit 0; }
+done
 
 # ── Colour output ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -166,7 +229,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)     DRY_RUN=1;             shift   ;;
     --verbose)     VERBOSE=1;             shift   ;;
     --help|-h)
-      sed -n '2,55p' "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
+      usage; exit 0 ;;
     *) abort "Unknown argument: $1. Use --help for usage." ;;
   esac
 done
