@@ -2,7 +2,6 @@
 # oss-verify.sh — Auto-detecting supply chain verification for any OSS tool on GitHub
 
 
-
 # ── Require bash 4+ ───────────────────────────────────────────────────────────
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
