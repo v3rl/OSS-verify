@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # oss-verify.sh — Auto-detecting supply chain verification for any OSS tool on GitHub
 
-
-# ── Require bash 4+ ───────────────────────────────────────────────────────────
+# ── Bash version ──────────────────────────────────────────────────────────────
+# mapfile and associative arrays require bash 4+.
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     if [[ -x "$candidate" && "$("$candidate" -c 'echo ${BASH_VERSINFO[0]}')" -ge 4 ]]; then
@@ -15,8 +15,8 @@ fi
 
 set -euo pipefail
 
-# ── Early --help exit (before dependency checks) ──────────────────────────────
-# Must be defined here so --help works even when cosign/jq are not installed
+# ── Usage ─────────────────────────────────────────────────────────────────────
+# Defined before dependency checks so --help works even without cosign/jq installed.
 usage() {
   cat << 'END_USAGE'
 oss-verify — Supply chain verification for any OSS tool on GitHub
@@ -72,46 +72,47 @@ LIMITATION
 END_USAGE
 }
 
+# Handle --help before anything else
 for arg in "$@"; do
   [[ "$arg" == "--help" || "$arg" == "-h" ]] && { usage; exit 0; }
 done
 
-# ── Colour output ─────────────────────────────────────────────────────────────
+# ── Output helpers ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 abort() { echo -e "${RED}[FAIL]${NC}  $*" >&2; exit 1; }
 step()  { echo -e "${CYAN}[STEP]${NC}  $*"; }
-debug() { [[ "${VERBOSE}" == "1" ]] && echo -e "       $*" || true; }
+debug() { [[ "${VERBOSE:-0}" == "1" ]] && echo -e "       $*" || true; }
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
+# ── Dependency checks ─────────────────────────────────────────────────────────
 MISSING_DEPS=()
 for cmd in curl jq cosign openssl; do
   command -v "$cmd" &>/dev/null || MISSING_DEPS+=("$cmd")
 done
 
-# sha256sum vs shasum (macOS) — detect busybox sha256sum too
+# sha256sum (Linux/GNU) vs shasum (macOS); also detect busybox sha256sum
+# which lacks --ignore-missing
+SHA256_TOOL="" SHA256_IGNORE_MISSING=0
 if command -v sha256sum &>/dev/null; then
-  if sha256sum --ignore-missing /dev/null &>/dev/null; then
-    SHA256_IGNORE_MISSING=1
-  else
-    SHA256_IGNORE_MISSING=0   # busybox
-  fi
   SHA256_TOOL="sha256sum"
+  sha256sum --ignore-missing /dev/null &>/dev/null && SHA256_IGNORE_MISSING=1
 elif command -v shasum &>/dev/null; then
   SHA256_TOOL="shasum"
-  SHA256_IGNORE_MISSING=0
 else
   MISSING_DEPS+=("sha256sum or shasum")
-  SHA256_TOOL=""
-  SHA256_IGNORE_MISSING=0
 fi
 
 [[ ${#MISSING_DEPS[@]} -gt 0 ]] \
-  && abort "Missing required tools: ${MISSING_DEPS[*]}"
+  && abort "Missing required tools: ${MISSING_DEPS[*]}\n        Install them and re-run."
 
-# base64 decode — Linux uses -d, macOS uses -D
-# Returns decoded bytes or empty string; caller must check output is non-empty
+# FIX #6: validate $HOME is set before using it in default paths
+[[ -z "${HOME:-}" ]] \
+  && abort "\$HOME is not set. Cannot determine default paths.\n        Set HOME or use --lock-dir and --install-dir explicitly."
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+
+# base64 decode — tries -d (Linux) then -D (macOS); returns empty string on failure
 base64_decode() {
   local input="${1:-}" output=""
   [[ -z "$input" ]] && { echo ""; return 0; }
@@ -121,51 +122,46 @@ base64_decode() {
   echo "${output:-}"
 }
 
-# sha256 of a single file — returns hex digest only
+# SHA256 of a single file — validates result is 64 hex chars before returning
+# FIX #7: return value validated so empty/failed hash is caught immediately
 file_sha256() {
-  local file="$1"
+  local file="$1" hash=""
   if [[ "$SHA256_TOOL" == "sha256sum" ]]; then
-    sha256sum "$file" | awk '{print $1}'
+    hash=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
   else
-    shasum -a 256 "$file" | awk '{print $1}'
+    hash=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}')
   fi
+  if ! [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    abort "Could not compute SHA256 of '$file'.\n        File may be unreadable or the hash tool failed."
+  fi
+  echo "$hash"
 }
 
-# ── FIX #3 + #4 (original): anchored, presence-confirmed checksum verification ──
+# Verify a binary against a checksums file — presence-confirmed, anchored match
 verify_checksums() {
   local checksums_file="$1" binary_file="$2"
   local binary_basename; binary_basename=$(basename "$binary_file")
 
-  # FIX #3: confirm binary is actually listed in checksums before trusting
-  # --ignore-missing exits 0 even when the file isn't mentioned at all
-  local binary_present=0
-  if grep -qF "$binary_basename" "$checksums_file" 2>/dev/null; then
-    binary_present=1
-  fi
-
-  if [[ "$binary_present" -eq 0 ]]; then
+  # Confirm the binary filename is actually listed before trusting --ignore-missing
+  # (sha256sum --ignore-missing exits 0 even when the file is not mentioned at all)
+  if ! grep -qF "$binary_basename" "$checksums_file" 2>/dev/null; then
     warn "Binary '$binary_basename' not found in checksums file."
     warn "Available entries:"
     awk '{print "    "$2}' "$checksums_file" >&2
     return 1
   fi
 
-  # Approach 1: sha256sum --ignore-missing (GNU coreutils, confirmed binary present)
+  # Approach 1: sha256sum --ignore-missing (GNU coreutils)
   if [[ "$SHA256_TOOL" == "sha256sum" && "$SHA256_IGNORE_MISSING" -eq 1 ]]; then
-    if sha256sum --ignore-missing -c "$checksums_file" &>/dev/null; then
-      return 0
-    fi
+    sha256sum --ignore-missing -c "$checksums_file" &>/dev/null && return 0
   fi
 
-  # Approach 2: shasum (macOS, confirmed binary present)
+  # Approach 2: shasum (macOS)
   if [[ "$SHA256_TOOL" == "shasum" ]]; then
-    if shasum -a 256 --ignore-missing -c "$checksums_file" &>/dev/null; then
-      return 0
-    fi
+    shasum -a 256 --ignore-missing -c "$checksums_file" &>/dev/null && return 0
   fi
 
-  # Approach 3: manual anchored grep — binary_basename already confirmed present
-  # FIX #4 (original): anchored so 'go' doesn't match 'golang'
+  # Approach 3: manual anchored grep — 'go' must not match 'golang'
   local expected_hash
   expected_hash=$(grep -E "(^|[[:space:]])${binary_basename}([[:space:]]|$)" \
     "$checksums_file" | awk '{print $1}' | head -1)
@@ -174,16 +170,12 @@ verify_checksums() {
     warn "Could not extract hash for '$binary_basename' from checksums file."
     return 1
   fi
-
-  # Validate it looks like a sha256 hash (64 hex chars)
   if ! [[ "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    abort "Extracted value for '$binary_basename' is not a valid SHA256 hash: '$expected_hash'"
+    abort "Value for '$binary_basename' in checksums file is not a valid SHA256 hash:\n        '$expected_hash'"
   fi
 
   local actual_hash; actual_hash=$(file_sha256 "$binary_file")
-  if [[ "$actual_hash" == "$expected_hash" ]]; then
-    return 0
-  fi
+  if [[ "$actual_hash" == "$expected_hash" ]]; then return 0; fi
 
   warn "SHA256 mismatch for $binary_basename"
   warn "  Expected: $expected_hash"
@@ -196,9 +188,8 @@ REPO=""
 VERSION=""
 BINARY_NAME=""
 TRUST_CUTOFF_DATE=""
+# OSS_VERIFY_LOCK_DIR is accepted from the environment but validated below
 LOCK_DIR="${OSS_VERIFY_LOCK_DIR:-${HOME}/.local/share/oss-verify}"
-# Note: OSS_VERIFY_LOCK_DIR is accepted from the environment here but is
-# validated by validate_path below — dangerous values like /etc/cron.d are caught.
 INSTALL_DIR="${HOME}/.local/bin"
 NO_INSTALL=0
 DRY_RUN=0
@@ -224,17 +215,16 @@ while [[ $# -gt 0 ]]; do
     --install-dir)
       [[ $# -ge 2 ]] || abort "--install-dir requires a value"
       INSTALL_DIR="$2"; shift 2 ;;
-    --no-install)  NO_INSTALL=1;           shift   ;;
-    --dry-run)     DRY_RUN=1;             shift   ;;
-    --verbose)     VERBOSE=1;             shift   ;;
-    --help|-h)
-      usage; exit 0 ;;
-    *) abort "Unknown argument: $1. Use --help for usage." ;;
+    --no-install)  NO_INSTALL=1;  shift ;;
+    --dry-run)     DRY_RUN=1;    shift ;;
+    --verbose)     VERBOSE=1;    shift ;;
+    --help|-h)     usage; exit 0 ;;
+    *) abort "Unknown argument: $1\n        Run --help for usage." ;;
   esac
 done
 
-# ── Validate required args ────────────────────────────────────────────────────
-[[ -z "$REPO" ]] && abort "--repo is required (e.g. --repo aquasecurity/trivy)"
+# ── Input validation ──────────────────────────────────────────────────────────
+[[ -z "$REPO" ]] && abort "--repo is required.\n        Example: --repo aquasecurity/trivy"
 
 if [[ -z "$VERSION" ]]; then
   echo -e "${RED}[FAIL]${NC}  --version is required. Auto-fetching latest is disabled by design." >&2
@@ -243,43 +233,46 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
-  || abort "Invalid --repo format. Expected owner/repo (e.g. aquasecurity/trivy)"
+  || abort "Invalid --repo format: '$REPO'\n        Expected: owner/repo (e.g. aquasecurity/trivy)"
 
-VERSION="${VERSION#v}"
+VERSION="${VERSION#v}"   # strip leading v if supplied (v0.70.0 → 0.70.0)
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][a-zA-Z0-9]+)*$ ]] \
-  || abort "Invalid version format: '$VERSION'"
+  || abort "Invalid --version format: '$VERSION'\n        Expected: x.y.z (e.g. 0.70.0)"
 
 if [[ -n "$BINARY_NAME" ]]; then
   [[ "$BINARY_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
-    || abort "Invalid --binary name: '$BINARY_NAME'. Alphanumeric, hyphen, underscore, dot only."
+    || abort "Invalid --binary name: '$BINARY_NAME'\n        Use alphanumeric characters, hyphens, underscores, or dots only."
 fi
 
-# FIX #2: OWNER removed — was declared but never used, dead code
 REPO_NAME="${REPO##*/}"
 
-# ── FIX #7: validate_path checks prefixes, not just exact matches ─────────────
+# Path validation — must be absolute, no .., not inside a system directory
+# Checks by prefix so /etc/cron.d is caught as well as /etc itself
 validate_path() {
   local label="$1" path="$2"
-
-  # Must be absolute
   [[ "$path" == /* ]] \
     || abort "$label must be an absolute path, got: '$path'"
-
-  # Must not contain .. components
   [[ "$path" == *..* ]] \
     && abort "$label must not contain '..', got: '$path'"
-
-  # FIX #7: prefix check — /etc/cron.d starts with /etc so is forbidden
   for forbidden in / /etc /usr /bin /sbin /boot /sys /proc /dev /root; do
     if [[ "$path" == "$forbidden" || "$path" == "${forbidden}/"* ]]; then
-      abort "$label cannot be inside system directory '$forbidden', got: '$path'"
+      abort "$label cannot be inside system directory '$forbidden', got: '$path'\n\
+        Use a path under your home directory instead."
     fi
   done
 }
 validate_path "--lock-dir"    "$LOCK_DIR"
 validate_path "--install-dir" "$INSTALL_DIR"
 
-# ── Detect OS and architecture ────────────────────────────────────────────────
+# ── FIX #3: check INSTALL_DIR is writable before doing any work ───────────────
+# mkdir -p succeeds even on a non-writable existing directory; we check explicitly
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+if [[ ! -w "$INSTALL_DIR" ]]; then
+  abort "Install directory is not writable: $INSTALL_DIR\n\
+        Either create it with write permission or use --install-dir to choose another path."
+fi
+
+# ── Platform detection ────────────────────────────────────────────────────────
 RAW_OS=$(uname -s)
 RAW_ARCH=$(uname -m)
 
@@ -300,25 +293,22 @@ info "Repo:    $REPO"
 info "Version: v${VERSION}"
 info "OS/Arch: ${OS}/${ARCH}"
 
-# ── curl helpers ──────────────────────────────────────────────────────────────
-# FIX #8: separate caps for API calls (1MB) vs binary downloads (uncapped)
-# Many security tool binaries are 80-150MB — the previous 10MB cap broke all downloads
+# ── Network helpers ───────────────────────────────────────────────────────────
+# Both functions enforce HTTPS and restrict CDN redirects to HTTPS destinations.
+# --location is required because GitHub release asset URLs redirect to
+# objects.githubusercontent.com for the actual file content.
 
-# For GitHub API calls and small signing files (bundles, certs, checksums)
-# FIX #2: --proto "=https" ensures protocol restriction matches binary_curl
-# --location follows GitHub's CDN redirect; --proto-redir "=https" keeps it HTTPS-only
+# For API calls and signing files — 1MB cap prevents DoS via huge response
 api_curl() {
   curl -sf --proto "=https" --location --proto-redir "=https" --max-filesize 1048576 "$@"
 }
 
-# For binary/archive downloads — no size cap, tools can be 100MB+
-# --location follows GitHub's CDN redirect (github.com → objects.githubusercontent.com)
-# --proto-redir "=https" ensures the redirect destination must be HTTPS — no downgrade
+# For binary/archive downloads — no size cap (tools can be 100MB+)
 binary_curl() {
   curl -sf --proto "=https" --location --proto-redir "=https" "$@"
 }
 
-# ── Fetch release assets from GitHub API ──────────────────────────────────────
+# ── GitHub API — fetch release assets ────────────────────────────────────────
 step "Fetching release asset list from GitHub API..."
 
 API_URL="https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}"
@@ -327,12 +317,24 @@ RELEASE_JSON=$(api_curl "$API_URL" 2>"$CURL_ERR") || {
   CURL_MSG=$(cat "$CURL_ERR"); rm -f "$CURL_ERR"
   abort "Could not fetch release info for v${VERSION}.\n\
         URL: https://github.com/${REPO}/releases/tag/v${VERSION}\n\
-        curl error: ${CURL_MSG:-unknown}"
+        curl error: ${CURL_MSG:-unknown}\n\
+        Check the repo name and version are correct."
 }
 rm -f "$CURL_ERR"
 
+# FIX #1: validate the API response is a JSON object with an assets key
+# before using it — catches "Not Found", rate-limit responses, and malformed JSON
+if ! printf '%s' "$RELEASE_JSON" | jq -e 'type == "object" and has("assets")' &>/dev/null; then
+  API_MSG=$(printf '%s' "$RELEASE_JSON" | jq -r '.message // empty' 2>/dev/null || true)
+  abort "GitHub API returned an unexpected response for v${VERSION}.\n\
+        ${API_MSG:+API message: $API_MSG\n        }URL: https://github.com/${REPO}/releases/tag/v${VERSION}\n\
+        Check the version exists and the repo is public."
+fi
+
 ASSET_COUNT=$(printf '%s' "$RELEASE_JSON" | jq '.assets | length')
-[[ "$ASSET_COUNT" -eq 0 ]] && abort "Release v${VERSION} has no assets."
+[[ "$ASSET_COUNT" -eq 0 ]] \
+  && abort "Release v${VERSION} exists but has no assets.\n\
+        Check https://github.com/${REPO}/releases/tag/v${VERSION}"
 
 mapfile -t ASSET_NAMES < <(printf '%s' "$RELEASE_JSON" | jq -r '.assets[].name')
 mapfile -t ASSET_URLS  < <(printf '%s' "$RELEASE_JSON" | jq -r '.assets[].browser_download_url')
@@ -342,77 +344,59 @@ if [[ "$VERBOSE" == "1" ]]; then
   for name in "${ASSET_NAMES[@]}"; do debug "  asset: $name"; done
 fi
 
-# Validate all asset URLs before storing — must be genuine GitHub URLs
+# Validate all asset URLs are genuine GitHub URLs before storing
 for url in "${ASSET_URLS[@]}"; do
   [[ "$url" =~ ^https://github\.com/ || "$url" =~ ^https://objects\.githubusercontent\.com/ ]] \
-    || abort "Unexpected asset URL (not from github.com): $url"
+    || abort "Unexpected asset URL in API response (not from github.com):\n        $url"
 done
 
-# ── Asset lookup ──────────────────────────────────────────────────────────────
-# FIX #1: use grep -F (literal string match) when matching asset names directly
-# Only fall back to -E regexp when we are building a structural pattern
+# ── Asset lookup functions ────────────────────────────────────────────────────
+# Use the most restrictive match possible to avoid false positives.
+# Literal == for exact names; glob suffix for suffix matches;
+# regexp only for binary detection where structural patterns are needed.
 
-# Literal match — for exact filename lookups (pattern detection)
+# Exact filename match
 find_asset_url_literal() {
   local target="$1"
   for i in "${!ASSET_NAMES[@]}"; do
-    if [[ "${ASSET_NAMES[$i]}" == "$target" ]]; then
-      echo "${ASSET_URLS[$i]}"
-      return 0
-    fi
+    [[ "${ASSET_NAMES[$i]}" == "$target" ]] && { echo "${ASSET_URLS[$i]}"; return 0; }
   done
   return 1
 }
 
-# Suffix match — for "filename + known suffix" lookups (safe, controlled pattern)
+# Exact filename + known suffix (e.g. binary.sigstore.json)
 find_asset_url_suffix() {
   local prefix="$1" suffix="$2"
-  local target="${prefix}${suffix}"
-  find_asset_url_literal "$target"
+  find_asset_url_literal "${prefix}${suffix}"
 }
 
-# Regexp match — only used for binary detection where structural patterns are needed
-# Pattern is always built internally from validated inputs, never from raw user data
+# Structural regexp — patterns are built from validated internal inputs only,
+# never from raw API data, to prevent backtracking or injection
 find_asset_url_regexp() {
   local pattern="$1"
   for i in "${!ASSET_NAMES[@]}"; do
-    if echo "${ASSET_NAMES[$i]}" | grep -qE "$pattern"; then
-      echo "${ASSET_URLS[$i]}"
-      return 0
-    fi
+    echo "${ASSET_NAMES[$i]}" | grep -qE "$pattern" && { echo "${ASSET_URLS[$i]}"; return 0; }
   done
   return 1
 }
 
-# Substring match — for checksums presence check (grep -F, no regexp)
+# Substring match (grep -F, no regexp)
 find_asset_url_contains() {
   local substring="$1"
   for i in "${!ASSET_NAMES[@]}"; do
-    if echo "${ASSET_NAMES[$i]}" | grep -qF "$substring"; then
-      echo "${ASSET_URLS[$i]}"
-      return 0
-    fi
+    echo "${ASSET_NAMES[$i]}" | grep -qF "$substring" && { echo "${ASSET_URLS[$i]}"; return 0; }
   done
   return 1
 }
 
-# FIX #3 (asset): ends-with match using glob — prevents matching foo_checksums.txt.sig
-# when looking for foo_checksums.txt, since the glob requires the suffix at the exact end.
+# Glob suffix match — prevents foo_checksums.txt.sig matching suffix _checksums.txt
 find_asset_url_endswith() {
   local suffix="$1"
   for i in "${!ASSET_NAMES[@]}"; do
-    # Glob *"${suffix}" guarantees name ends exactly with suffix — no redundant inner check needed
-    if [[ "${ASSET_NAMES[$i]}" == *"${suffix}" ]]; then
-      echo "${ASSET_URLS[$i]}"
-      return 0
-    fi
+    [[ "${ASSET_NAMES[$i]}" == *"${suffix}" ]] && { echo "${ASSET_URLS[$i]}"; return 0; }
   done
   return 1
 }
-
-has_asset_literal()   { find_asset_url_literal   "$1" &>/dev/null; }
-has_asset_suffix()    { find_asset_url_suffix     "$1" "$2" &>/dev/null; }
-has_asset_contains()  { find_asset_url_contains   "$1" &>/dev/null; }
 
 # ── Binary asset detection ────────────────────────────────────────────────────
 step "Detecting binary asset for ${OS}/${ARCH}..."
@@ -434,62 +418,38 @@ BINARY_CANDIDATES=("$REPO_NAME")
 [[ -n "$BINARY_NAME" && "$BINARY_NAME" != "$REPO_NAME" ]] \
   && BINARY_CANDIDATES=("$BINARY_NAME" "$REPO_NAME")
 
-BINARY_URL=""
-BINARY_FILENAME=""
-BINARY_EXT=""
-IS_RAW_BINARY=0
-DETECTED_BINARY_NAME=""
+BINARY_URL="" BINARY_FILENAME="" BINARY_EXT="" IS_RAW_BINARY=0 DETECTED_BINARY_NAME=""
 
-# FIX #1: try_match uses find_asset_url_regexp — pattern built only from
-# validated inputs (binary_candidate, os_label, arch_label, ext) — never from
-# raw asset names or user data that could cause backtracking
+# try_match: attempt to find a binary archive matching a specific naming convention.
+# All patterns are built from validated inputs — never from raw API data.
 try_match() {
   local name_hint="$1" os_label="$2" arch_label="$3" ext="$4"
-  local url ext_escaped="${ext//./\\.}"
+  local url ext_esc="${ext//./\\.}"
 
-  # Pattern 1: name_version_os_arch.ext  (trivy, grype, syft)
-  url=$(find_asset_url_regexp \
-    "^${name_hint}[_.-][^/]*${os_label}[_.-]${arch_label}[^/]*\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p1: ${url##*/}"; return 0; }
-
-  # Pattern 2: name_version_arch_os.ext
-  url=$(find_asset_url_regexp \
-    "^${name_hint}[_.-][^/]*${arch_label}[_.-]${os_label}[^/]*\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p2: ${url##*/}"; return 0; }
-
-  # Pattern 3: name-version-os-arch.ext  (ripgrep style)
-  url=$(find_asset_url_regexp \
-    "^${name_hint}-[0-9][^/]*-${os_label}-${arch_label}[^/]*\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p3: ${url##*/}"; return 0; }
-
-  # Pattern 4: name-version-arch-os.ext
-  url=$(find_asset_url_regexp \
-    "^${name_hint}-[0-9][^/]*-${arch_label}-${os_label}[^/]*\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p4: ${url##*/}"; return 0; }
-
-  # Pattern 5: name_os_arch.ext  (no version — crane)
-  url=$(find_asset_url_regexp \
-    "^${name_hint}[_.-]${os_label}[_.-]${arch_label}\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p5: ${url##*/}"; return 0; }
-
-  # Pattern 6: name_arch_os.ext
-  url=$(find_asset_url_regexp \
-    "^${name_hint}[_.-]${arch_label}[_.-]${os_label}\\.${ext_escaped}$") \
-    && { BINARY_URL="$url"; debug "Matched p6: ${url##*/}"; return 0; }
-
+  url=$(find_asset_url_regexp "^${name_hint}[_.-][^/]*${os_label}[_.-]${arch_label}[^/]*\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (os_arch): ${url##*/}"; return 0; }
+  url=$(find_asset_url_regexp "^${name_hint}[_.-][^/]*${arch_label}[_.-]${os_label}[^/]*\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (arch_os): ${url##*/}"; return 0; }
+  url=$(find_asset_url_regexp "^${name_hint}-[0-9][^/]*-${os_label}-${arch_label}[^/]*\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (dash os_arch): ${url##*/}"; return 0; }
+  url=$(find_asset_url_regexp "^${name_hint}-[0-9][^/]*-${arch_label}-${os_label}[^/]*\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (dash arch_os): ${url##*/}"; return 0; }
+  url=$(find_asset_url_regexp "^${name_hint}[_.-]${os_label}[_.-]${arch_label}\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (no version os_arch): ${url##*/}"; return 0; }
+  url=$(find_asset_url_regexp "^${name_hint}[_.-]${arch_label}[_.-]${os_label}\\.${ext_esc}$") \
+    && { BINARY_URL="$url"; debug "Matched (no version arch_os): ${url##*/}"; return 0; }
   return 1
 }
 
+# Try every combination of binary name candidate, OS label, arch label, extension
 outer_break=0
 for binary_candidate in "${BINARY_CANDIDATES[@]}"; do
   for os_label in "${OS_LABELS[@]}"; do
     for arch_label in "${ARCH_LABELS[@]}"; do
       for ext in "${EXTENSIONS[@]}"; do
         if try_match "$binary_candidate" "$os_label" "$arch_label" "$ext"; then
-          BINARY_FILENAME="${BINARY_URL##*/}"
-          BINARY_EXT="$ext"
-          DETECTED_BINARY_NAME="$binary_candidate"
-          outer_break=1; break
+          BINARY_FILENAME="${BINARY_URL##*/}"; BINARY_EXT="$ext"
+          DETECTED_BINARY_NAME="$binary_candidate"; outer_break=1; break
         fi
       done
       [[ "$outer_break" -eq 1 ]] && break
@@ -499,22 +459,20 @@ for binary_candidate in "${BINARY_CANDIDATES[@]}"; do
   [[ "$outer_break" -eq 1 ]] && break
 done
 
-# Fallback: raw binary (no archive) — e.g. cosign-linux-amd64
+# Fallback: raw binary (no archive), e.g. cosign-linux-amd64
 if [[ -z "$BINARY_URL" ]]; then
   debug "No archive found — trying raw binary patterns"
   for binary_candidate in "${BINARY_CANDIDATES[@]}"; do
     for os_label in "${OS_LABELS[@]}"; do
       for arch_label in "${ARCH_LABELS[@]}"; do
         for sep in "-" "_" "."; do
-          url=$(find_asset_url_regexp \
-            "^${binary_candidate}[_.-]${os_label}${sep}${arch_label}$") \
-            && { BINARY_URL="$url"; BINARY_FILENAME="${url##*/}";
-                 DETECTED_BINARY_NAME="$binary_candidate"; IS_RAW_BINARY=1;
+          url=$(find_asset_url_regexp "^${binary_candidate}[_.-]${os_label}${sep}${arch_label}$") \
+            && { BINARY_URL="$url"; BINARY_FILENAME="${url##*/}"
+                 DETECTED_BINARY_NAME="$binary_candidate"; IS_RAW_BINARY=1
                  debug "Matched raw binary: $BINARY_FILENAME"; break 4; }
-          url=$(find_asset_url_regexp \
-            "^${binary_candidate}[_.-]${arch_label}${sep}${os_label}$") \
-            && { BINARY_URL="$url"; BINARY_FILENAME="${url##*/}";
-                 DETECTED_BINARY_NAME="$binary_candidate"; IS_RAW_BINARY=1;
+          url=$(find_asset_url_regexp "^${binary_candidate}[_.-]${arch_label}${sep}${os_label}$") \
+            && { BINARY_URL="$url"; BINARY_FILENAME="${url##*/}"
+                 DETECTED_BINARY_NAME="$binary_candidate"; IS_RAW_BINARY=1
                  debug "Matched raw binary (arch-os): $BINARY_FILENAME"; break 4; }
         done
       done
@@ -524,29 +482,23 @@ fi
 
 [[ -z "$BINARY_URL" ]] && abort \
   "Could not find a binary asset for ${OS}/${ARCH} in release v${VERSION}.\n\
-        Run with --verbose to list all available assets.\n\
-        If the binary name differs from the repo name, use --binary <name>.\n\
-        All assets:\n$(printf '          %s\n' "${ASSET_NAMES[@]}")"
+        Tips:\n\
+          • Run with --verbose to see all available assets\n\
+          • If the binary name differs from the repo name, use --binary <name>\n\
+        Available assets:\n$(printf '          %s\n' "${ASSET_NAMES[@]}")"
 
 BINARY_NAME="${BINARY_NAME:-${DETECTED_BINARY_NAME:-$REPO_NAME}}"
-
 info "Binary:  $BINARY_FILENAME"
 info "Name:    $BINARY_NAME"
 
 # ── Signing pattern detection ─────────────────────────────────────────────────
-# FIX #1: pattern detection uses find_asset_url_literal and find_asset_url_suffix
-# (exact string comparisons) — no regexp against asset names from the API
+# Uses exact/suffix/endswith matching against API data — no regexp on untrusted input
 step "Detecting signing pattern..."
 
-PATTERN=""
-BUNDLE_URL=""
-CHECKSUMS_URL=""
-CHECKSUMS_FILENAME=""
-CHECKSUMS_PEM_URL=""
-CHECKSUMS_SIG_URL=""
-CHECKSUMS_BUNDLE_URL=""
+PATTERN="" BUNDLE_URL="" CHECKSUMS_URL="" CHECKSUMS_FILENAME=""
+CHECKSUMS_PEM_URL="" CHECKSUMS_SIG_URL="" CHECKSUMS_BUNDLE_URL=""
 
-# Pattern A: sigstore bundle attached directly to binary — literal suffix lookup
+# Pattern A: sigstore bundle attached directly to binary
 for bundle_suffix in ".sigstore.json" ".sigstore" ".bundle" ".jsonl"; do
   url=$(find_asset_url_suffix "$BINARY_FILENAME" "$bundle_suffix") && {
     BUNDLE_URL="$url"; PATTERN="direct_bundle"
@@ -554,18 +506,15 @@ for bundle_suffix in ".sigstore.json" ".sigstore" ".bundle" ".jsonl"; do
   }
 done
 
-# Pattern B/C: checksums file — use contains match (grep -F) for naming variants
+# Pattern B/C: checksums file + signing material
 if [[ -z "$PATTERN" ]]; then
-  for checksums_name in \
-    "checksums.txt" "sha256sums.txt" "SHA256SUMS" "checksums" "sha256sums"
-  do
-    # Try exact name first
+  for checksums_name in "checksums.txt" "sha256sums.txt" "SHA256SUMS" "checksums" "sha256sums"; do
     url=$(find_asset_url_literal "$checksums_name") && {
       CHECKSUMS_URL="$url"; CHECKSUMS_FILENAME="$checksums_name"
       debug "Checksums (exact): $checksums_name"; break
     }
-    # Try with version prefix (e.g. trivy_0.70.0_checksums.txt)
-    # Use ends-with match so checksums.txt.sig is NOT mistaken for checksums.txt
+    # Versioned prefix e.g. trivy_0.70.0_checksums.txt
+    # endswith prevents checksums.txt.sig from matching _checksums.txt
     url=$(find_asset_url_endswith "_${checksums_name}") && {
       CHECKSUMS_URL="$url"; CHECKSUMS_FILENAME="${url##*/}"
       debug "Checksums (versioned): $CHECKSUMS_FILENAME"; break
@@ -573,15 +522,13 @@ if [[ -z "$PATTERN" ]]; then
   done
 
   if [[ -n "$CHECKSUMS_URL" ]]; then
-    PEM_URL=""; SIG_URL=""
+    PEM_URL="" SIG_URL=""
 
-    # FIX #1: suffix lookups — exact string, no regexp
     for cert_suffix in ".pem" ".crt" ".cert"; do
       url=$(find_asset_url_suffix "$CHECKSUMS_FILENAME" "$cert_suffix") && {
         PEM_URL="$url"; debug "Cert: ${url##*/}"; break
       }
     done
-
     for sig_suffix in ".sig" ".signature" ".asc"; do
       url=$(find_asset_url_suffix "$CHECKSUMS_FILENAME" "$sig_suffix") && {
         SIG_URL="$url"; debug "Sig: ${url##*/}"; break
@@ -604,9 +551,9 @@ if [[ -z "$PATTERN" ]]; then
 fi
 
 [[ -z "$PATTERN" ]] && abort \
-  "Could not detect a signing pattern.\n\
-        No sigstore bundle, checksums, or signature files found.\n\
-        Run --verbose to see all assets."
+  "Could not detect a signing pattern for this release.\n\
+        No sigstore bundle, checksums, or signature files were found.\n\
+        Run with --verbose to see all available assets."
 
 info "Pattern: $PATTERN"
 
@@ -634,43 +581,52 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-# ── Work in temp dir ──────────────────────────────────────────────────────────
+# ── Working directory ─────────────────────────────────────────────────────────
 WORKDIR=$(mktemp -d)
 chmod 700 "$WORKDIR"
 trap 'rm -rf "$WORKDIR"' EXIT
-cd "$WORKDIR"
+
+# FIX #8: cd into WORKDIR and abort clearly on failure
+# Without this, a failed cd would leave relative paths broken while set -e exits
+cd "$WORKDIR" || abort "Failed to enter working directory: $WORKDIR"
+
 mkdir -p "$LOCK_DIR"
 chmod 700 "$LOCK_DIR"
 
 # ── Download helpers ──────────────────────────────────────────────────────────
-# Validate URL is a genuine GitHub URL before downloading
+# Both validate the URL is a genuine GitHub URL before downloading
+
 assert_github_url() {
   local url="$1"
   [[ "$url" =~ ^https://github\.com/ || "$url" =~ ^https://objects\.githubusercontent\.com/ ]] \
-    || abort "Refusing to download from non-GitHub URL: $url"
+    || abort "Refusing to download from unexpected URL (not from github.com):\n        $url"
 }
 
-# Download a signing file (bundle, cert, checksums) — capped at 1MB
+# Signing files: certs, checksums, bundles — 1MB cap
 download_signing_file() {
   local url="$1" dest="$2" label="${3:-${url##*/}}"
   info "Downloading $label ..."
   assert_github_url "$url"
   api_curl "$url" -o "$dest" \
-    || abort "Failed to download signing file: $url"
-  [[ -s "$dest" ]] || abort "Downloaded signing file is empty: $dest"
+    || abort "Failed to download: $label\n        URL: $url"
+  [[ -s "$dest" ]] || abort "Downloaded file is empty: $label\n        URL: $url"
 }
 
-# FIX #8: Download a binary/archive — no size cap
+# Binary/archive downloads — no size cap
 download_binary() {
   local url="$1" dest="$2" label="${3:-${url##*/}}"
   info "Downloading $label ..."
   assert_github_url "$url"
   binary_curl "$url" -o "$dest" \
-    || abort "Failed to download binary: $url"
-  [[ -s "$dest" ]] || abort "Downloaded binary is empty: $dest"
+    || abort "Failed to download: $label\n        URL: $url"
+  [[ -s "$dest" ]] || abort "Downloaded binary is empty: $label\n        URL: $url"
 }
 
-# ── Extract cosign identity from cert/bundle ──────────────────────────────────
+# ── Identity extraction ───────────────────────────────────────────────────────
+# Extracts the GitHub Actions workflow URI from a signing cert or bundle.
+# Tries multiple strategies to handle different cert formats in the wild.
+# Aborts if the identity cannot be extracted — no fallback to a broad regexp.
+
 extract_identity() {
   local file="$1" file_type="${2:-auto}"
 
@@ -685,12 +641,12 @@ extract_identity() {
   local san=""
 
   if [[ "$file_type" == "pem" ]]; then
-    # Strategy 1: standard X.509 text output — works for most single-cert PEM files
+    # Strategy 1: standard X.509 PEM — works for most tools
     san=$(openssl x509 -in "$file" -noout -text 2>/dev/null \
       | grep -A2 "Subject Alternative Name" \
       | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
 
-    # Strategy 2: some tools ship a certificate chain — try each cert in the PEM
+    # Strategy 2: certificate chain — try each cert block individually
     if [[ -z "$san" ]]; then
       local cert_block=""
       while IFS= read -r line; do
@@ -700,29 +656,23 @@ extract_identity() {
           candidate=$(printf '%s' "$cert_block" | openssl x509 -noout -text 2>/dev/null \
             | grep -A2 "Subject Alternative Name" \
             | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
-          if [[ -n "$candidate" ]]; then
-            san="$candidate"
-            break
-          fi
+          [[ -n "$candidate" ]] && { san="$candidate"; break; }
           cert_block=""
         fi
       done < "$file"
     fi
 
-    # Strategy 3: the entire PEM file is itself base64-encoded (e.g. Grype)
-    # The file contains base64(-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----)
-    # Decode the whole file content and then parse the resulting PEM normally
+    # Strategy 3: base64-encoded PEM (e.g. Grype)
+    # The entire file content is base64(-----BEGIN CERTIFICATE-----...END-----)
     if [[ -z "$san" ]]; then
       local b64_content decoded_pem
       b64_content=$(tr -d '[:space:]' < "$file")
       decoded_pem=$(base64_decode "$b64_content") || true
       if [[ -n "$decoded_pem" ]]; then
-        # Try parsing the decoded content as a standard PEM certificate
         san=$(printf '%s' "$decoded_pem" \
           | openssl x509 -noout -text 2>/dev/null \
           | grep -A2 "Subject Alternative Name" \
           | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
-        # Also try each cert block in case it's a chain
         if [[ -z "$san" ]]; then
           local cert_block2=""
           while IFS= read -r line; do
@@ -732,10 +682,7 @@ extract_identity() {
               candidate2=$(printf '%s' "$cert_block2" | openssl x509 -noout -text 2>/dev/null \
                 | grep -A2 "Subject Alternative Name" \
                 | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
-              if [[ -n "$candidate2" ]]; then
-                san="$candidate2"
-                break
-              fi
+              [[ -n "$candidate2" ]] && { san="$candidate2"; break; }
               cert_block2=""
             fi
           done <<< "$decoded_pem"
@@ -743,48 +690,35 @@ extract_identity() {
       fi
     fi
 
-    # Strategy 4: the .pem may actually be a Sigstore bundle JSON — try parsing as bundle
+    # Strategy 4: file is actually a Sigstore JSON bundle with a .pem extension
     if [[ -z "$san" ]]; then
       local raw_bytes=""
-      raw_bytes=$(jq -r \
-        '.verificationMaterial.certificate.rawBytes // empty' "$file" 2>/dev/null) || true
-      if [[ -z "$raw_bytes" ]]; then
-        raw_bytes=$(jq -r \
-          '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes // empty' \
+      raw_bytes=$(jq -r '.verificationMaterial.certificate.rawBytes // empty' "$file" 2>/dev/null) || true
+      [[ -z "$raw_bytes" ]] && \
+        raw_bytes=$(jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes // empty' \
           "$file" 2>/dev/null) || true
-      fi
       if [[ -n "$raw_bytes" ]]; then
         local decoded2; decoded2=$(base64_decode "$raw_bytes")
-        if [[ -n "$decoded2" ]]; then
-          san=$(printf '%s' "$decoded2" \
-            | openssl x509 -noout -text 2>/dev/null \
-            | grep -A2 "Subject Alternative Name" \
-            | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
-        fi
+        [[ -n "$decoded2" ]] || abort "base64 decoding of certificate bytes produced empty output — bundle may be corrupt."
+        san=$(printf '%s' "$decoded2" \
+          | openssl x509 -noout -text 2>/dev/null \
+          | grep -A2 "Subject Alternative Name" \
+          | grep -oE 'URI:[^,]+' | sed 's/URI://' | tr -d ' ' | head -1) || true
       fi
     fi
 
   elif [[ "$file_type" == "bundle" ]]; then
     local raw_bytes=""
-
-    raw_bytes=$(jq -r \
-      '.verificationMaterial.certificate.rawBytes // empty' "$file" 2>/dev/null) || true
-
-    if [[ -z "$raw_bytes" ]]; then
-      raw_bytes=$(jq -r \
-        '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes // empty' \
+    raw_bytes=$(jq -r '.verificationMaterial.certificate.rawBytes // empty' "$file" 2>/dev/null) || true
+    [[ -z "$raw_bytes" ]] && \
+      raw_bytes=$(jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes // empty' \
         "$file" 2>/dev/null) || true
-    fi
-
-    if [[ -z "$raw_bytes" ]]; then
+    [[ -z "$raw_bytes" ]] && \
       raw_bytes=$(jq -r '.cert // empty' "$file" 2>/dev/null) || true
-    fi
 
     if [[ -n "$raw_bytes" ]]; then
       local decoded; decoded=$(base64_decode "$raw_bytes")
-      if [[ -z "$decoded" ]]; then
-        abort "base64 decoding of certificate bytes produced empty output — bundle may be corrupt."
-      fi
+      [[ -n "$decoded" ]] || abort "base64 decoding of certificate bytes produced empty output — bundle may be corrupt."
       san=$(echo "$decoded" \
         | openssl x509 -noout -text 2>/dev/null \
         | grep -A2 "Subject Alternative Name" \
@@ -792,120 +726,119 @@ extract_identity() {
     fi
   fi
 
+  # Show diagnostic detail in verbose mode to help identify unsupported cert formats
   if [[ -z "$san" ]]; then
-    # Show diagnostic info in verbose mode to help identify the file format
-    if [[ "${VERBOSE}" == "1" ]]; then
-      warn "PEM/bundle file head:"
+    if [[ "${VERBOSE:-0}" == "1" ]]; then
+      warn "File head (first 5 lines):"
       head -5 "$file" >&2 || true
       warn "openssl x509 output:"
       openssl x509 -in "$file" -noout -text 2>&1 | head -20 >&2 || true
     fi
-    abort "Could not extract signing identity from $file.\n\
-        Run with --verbose for diagnostic output.\n\
-        Bundle format may be unsupported or file is malformed.\n\
-        Do not proceed without a verified identity."
+    abort "Could not extract signing identity from $(basename "$file").\n\
+        All known cert formats were tried.\n\
+        Run with --verbose for diagnostic output."
   fi
 
-  # Validate the SAN looks like a GitHub Actions URL
+  # Identity must look like a GitHub Actions workflow URL
   if ! [[ "$san" =~ ^https://github\.com/.+/\.github/workflows/.+ ]]; then
-    abort "Extracted identity is not a GitHub Actions workflow URL:\n        '$san'\n\
+    abort "Extracted identity is not a GitHub Actions workflow URL:\n\
+        Got:      '$san'\n\
         Expected: https://github.com/<owner>/<repo>/.github/workflows/<file>@refs/...\n\
-        Aborting — do not proceed with an unrecognised identity."
+        This may indicate the release was not signed by a standard GitHub Actions workflow."
   fi
 
   echo "$san"
 }
 
+# Strip the version-specific @refs/... suffix and escape dots for use as a regexp.
+# e.g. https://github.com/org/tool/.github/workflows/release.yaml@refs/tags/v1.2.3
+#   → https://github\.com/org/tool/\.github/workflows/release\.yaml
 identity_to_regexp() {
   local uri="$1"
   uri="${uri%%@refs/*}"
   uri="${uri//./\\.}"
+  # FIX #5: validate result is non-empty before returning
+  # An empty regexp passed to cosign --certificate-identity-regexp would match anything
+  [[ -z "$uri" ]] && abort "identity_to_regexp produced an empty regexp — identity was: '$1'"
   echo "$uri"
 }
 
-# ── Timestamp helpers ─────────────────────────────────────────────────────────
+# ── Timestamp extraction ──────────────────────────────────────────────────────
+
+# Extract integratedTime (Unix epoch) from a Rekor entry in a sigstore bundle
 timestamp_from_bundle() {
   local file="$1" epoch=""
 
-  epoch=$(jq -r \
-    '.verificationMaterial.tlogEntries[0].integratedTime // empty' \
+  epoch=$(jq -r '.verificationMaterial.tlogEntries[0].integratedTime // empty' \
     "$file" 2>/dev/null) || true
-
-  if [[ -z "$epoch" ]]; then
+  [[ -z "$epoch" ]] && \
     epoch=$(jq -r '.[0].integratedTime // empty' "$file" 2>/dev/null) || true
-  fi
 
+  # Validate it looks like a Unix timestamp (numeric only)
   if [[ -n "$epoch" ]] && ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
     warn "Unexpected timestamp format in bundle: '$epoch' — ignoring"
     epoch=""
   fi
-
   echo "${epoch:-}"
 }
 
+# Extract notBefore from a PEM signing certificate.
+# Uses openssl x509 first, then asn1parse as a fallback for Fulcio P-384 certs
+# that OpenSSL 3.0 refuses to parse via the x509 subcommand.
 timestamp_from_pem() {
-  local pem="$1" raw epoch="" decoded_pem=""
+  local pem="$1"
 
-  # Helper: extract notBefore from a PEM string using openssl x509 or asn1parse fallback
+  # Inner helper: given a PEM string, return the notBefore as a parseable date string
   _extract_notbefore() {
     local pem_str="$1"
 
-    # Strategy A: standard -startdate (works for most certs)
+    # Strategy A: standard -startdate
     local date_str
     date_str=$(printf '%s' "$pem_str" \
       | openssl x509 -noout -startdate 2>/dev/null \
       | sed 's/notBefore=//') || true
-    if [[ -n "$date_str" ]]; then echo "$date_str"; return 0; fi
+    [[ -n "$date_str" ]] && { echo "$date_str"; return 0; }
 
-    # Strategy B: asn1parse — works even when Subject is empty (e.g. Grype/Fulcio certs)
-    # UTCTIME format is YYMMDDHHmmSSZ — pick the first UTCTIME which is notBefore
-    # FIX: use [[:space:]] not \s for POSIX sed compatibility (BSD sed on macOS)
-    # FIX: also handle GENERALIZEDTIME (YYYYMMDDHHMMSSZ) for completeness
+    # Strategy B: asn1parse — reads raw ASN.1 structure without chain validation
+    # Safe because this is called after cosign has already verified the cert.
+    # Handles UTCTIME (YYMMDDHHMMSSZ, length 13) and GENERALIZEDTIME (length 15)
     local asn1_line asn1_date
     asn1_line=$(printf '%s' "$pem_str" \
       | openssl asn1parse -inform PEM 2>/dev/null \
       | grep -E "UTCTIME|GENERALIZEDTIME" | head -1) || true
     if [[ -n "$asn1_line" ]]; then
-      # Extract the date value after the last colon
       asn1_date="${asn1_line##*:}"
-      asn1_date="${asn1_date// /}"   # strip spaces
+      asn1_date="${asn1_date// /}"
       if [[ ${#asn1_date} -eq 13 && "$asn1_date" =~ ^[0-9]{12}Z$ ]]; then
-        # UTCTIME: YYMMDDHHMMSSZ
-        local yy mm dd hh mi ss full_year
+        local yy mm dd hh mi ss fy
         yy="${asn1_date:0:2}"; mm="${asn1_date:2:2}"; dd="${asn1_date:4:2}"
         hh="${asn1_date:6:2}"; mi="${asn1_date:8:2}"; ss="${asn1_date:10:2}"
-        if [[ "$yy" -lt 50 ]]; then full_year="20${yy}"; else full_year="19${yy}"; fi
-        echo "${full_year}-${mm}-${dd} ${hh}:${mi}:${ss} UTC"
-        return 0
+        [[ "$yy" -lt 50 ]] && fy="20${yy}" || fy="19${yy}"
+        echo "${fy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC"; return 0
       elif [[ ${#asn1_date} -eq 15 && "$asn1_date" =~ ^[0-9]{14}Z$ ]]; then
-        # GENERALIZEDTIME: YYYYMMDDHHMMSSZ
-        local ymd_y ymd_m ymd_d ymd_h ymd_mi ymd_s
-        ymd_y="${asn1_date:0:4}"; ymd_m="${asn1_date:4:2}"; ymd_d="${asn1_date:6:2}"
-        ymd_h="${asn1_date:8:2}"; ymd_mi="${asn1_date:10:2}"; ymd_s="${asn1_date:12:2}"
-        echo "${ymd_y}-${ymd_m}-${ymd_d} ${ymd_h}:${ymd_mi}:${ymd_s} UTC"
+        echo "${asn1_date:0:4}-${asn1_date:4:2}-${asn1_date:6:2} ${asn1_date:8:2}:${asn1_date:10:2}:${asn1_date:12:2} UTC"
         return 0
       fi
     fi
-
     return 1
   }
 
-  # First try reading the file directly as a standard PEM certificate
+  local raw="" epoch="" decoded_pem=""
+
+  # Try the file directly as a standard PEM certificate
   raw=$(_extract_notbefore "$(cat "$pem")") || true
 
-  # If that failed, the file may be base64-encoded PEM (e.g. Grype)
+  # If that failed, try decoding as base64-encoded PEM (e.g. Grype)
   if [[ -z "$raw" ]]; then
     local b64_content
     b64_content=$(tr -d '[:space:]' < "$pem")
     decoded_pem=$(base64_decode "$b64_content") || true
-    if [[ -n "$decoded_pem" ]]; then
-      raw=$(_extract_notbefore "$decoded_pem") || true
-    fi
+    [[ -n "$decoded_pem" ]] && raw=$(_extract_notbefore "$decoded_pem") || true
   fi
 
   [[ -z "$raw" ]] && { echo ""; return; }
 
-  # Convert to Unix epoch — try GNU date then BSD date
+  # Convert the date string to a Unix epoch — try GNU date then BSD date (macOS)
   epoch=$(date -u -d "$raw" '+%s' 2>/dev/null) \
     || epoch=$(date -u -j -f "%Y-%m-%d %H:%M:%S %Z" "$raw" '+%s' 2>/dev/null) \
     || epoch=$(date -u -j -f "%b %d %T %Y %Z" "$raw" '+%s' 2>/dev/null) \
@@ -921,51 +854,53 @@ epoch_to_date() {
     || echo "unknown (epoch: $epoch)"
 }
 
-# ── FIX #6: require a real non-zero epoch — abort if empty or zero ────────────
+# Abort if the signing epoch is missing or zero — prevents meaningless lockfile entries
 require_epoch() {
-  local signing_epoch="$1" context="$2"
-  if [[ -z "$signing_epoch" || "$signing_epoch" == "0" ]]; then
+  local epoch="$1" context="$2"
+  if [[ -z "$epoch" || "$epoch" == "0" ]]; then
     abort "Could not extract a valid signing timestamp from $context.\n\
-        A zero or missing timestamp would produce a meaningless lockfile entry.\n\
-        Aborting to avoid writing unverifiable data."
+        Aborting to avoid writing an unverifiable lockfile entry.\n\
+        Run with --verbose for diagnostic detail."
   fi
 }
 
+# ── Trust cutoff ──────────────────────────────────────────────────────────────
 check_cutoff() {
   local signing_epoch="$1"
 
-  if [[ -z "$TRUST_CUTOFF_DATE" ]]; then
+  [[ -z "$TRUST_CUTOFF_DATE" ]] && {
     warn "No --cutoff set — skipping timestamp window check."
     return 0
-  fi
+  }
 
   if [[ -z "$signing_epoch" || "$signing_epoch" == "0" ]]; then
-    abort "--cutoff was set but signing timestamp could not be extracted.\n\
-        Cannot enforce cutoff without a verified timestamp. Aborting."
+    abort "--cutoff is set but the signing timestamp could not be extracted.\n\
+        Cannot enforce the cutoff without a verified timestamp."
   fi
 
-  # FIX #4: validate cutoff is strictly YYYY-MM-DD before passing to date -d
-  # Prevents relative strings like "yesterday" or "next friday" being accepted
+  # Strictly YYYY-MM-DD only — prevents relative strings like "yesterday"
   [[ "$TRUST_CUTOFF_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
-    || abort "Invalid --cutoff date '$TRUST_CUTOFF_DATE'. Must be YYYY-MM-DD (e.g. 2026-03-01)."
+    || abort "Invalid --cutoff date: '$TRUST_CUTOFF_DATE'\n        Required format: YYYY-MM-DD (e.g. 2026-03-01)"
 
-  # Also validate it represents a real calendar date
   local cutoff_epoch
   cutoff_epoch=$(date -u -d "$TRUST_CUTOFF_DATE" '+%s' 2>/dev/null) \
     || cutoff_epoch=$(date -u -j -f "%Y-%m-%d" "$TRUST_CUTOFF_DATE" '+%s' 2>/dev/null) \
-    || abort "Invalid --cutoff date '$TRUST_CUTOFF_DATE' — not a valid calendar date."
+    || abort "Invalid --cutoff date: '$TRUST_CUTOFF_DATE' is not a valid calendar date."
 
-  if [[ "$signing_epoch" -gt "$cutoff_epoch" ]]; then
-    abort "Binary was signed AFTER trust cutoff ($TRUST_CUTOFF_DATE). Refusing to install."
-  fi
+  [[ "$signing_epoch" -gt "$cutoff_epoch" ]] \
+    && abort "Binary was signed AFTER trust cutoff ($TRUST_CUTOFF_DATE). Refusing to install."
   info "Timestamp check passed — signed before cutoff ($TRUST_CUTOFF_DATE)"
 }
 
-# ── cosign verify — two attempts, both with pinned issuer ────────────────────
+# ── cosign verification ───────────────────────────────────────────────────────
+# Two attempts, both pinning --certificate-oidc-issuer.
+# No issuer-free fallback — dropping the issuer would accept any OIDC provider.
 run_cosign_verify() {
   local subject="$1" identity="$2" issuer="$3"
   shift 3
   local extra_flags=("$@")
+
+  # FIX #5: validate identity_to_regexp produces a non-empty value
   local regexp; regexp=$(identity_to_regexp "$identity")
 
   debug "cosign subject:           $subject"
@@ -983,7 +918,7 @@ run_cosign_verify() {
   fi
 
   # Attempt 2: regexp identity + pinned issuer
-  # Needed when tools embed the version tag in the identity URI
+  # Some tools embed the version tag in the identity URI; regexp strips it
   if cosign verify-blob "$subject" \
       --certificate-identity-regexp="$regexp" \
       --certificate-oidc-issuer="$issuer" \
@@ -992,7 +927,6 @@ run_cosign_verify() {
     return 0
   fi
 
-  # No issuer-free fallback — dropping the issuer accepts any OIDC provider
   abort "cosign verification FAILED for $(basename "$subject").\n\
         Identity tried (exact):  $identity\n\
         Identity tried (regexp): $regexp\n\
@@ -1011,29 +945,42 @@ check_or_write_lockfile() {
   while [[ $# -ge 2 ]]; do hashes["$1"]="$2"; shift 2; done
 
   if [[ -f "$LOCKFILE" ]]; then
-    # FIX #3 + #5 (lockfile): verify lockfile is owned by current user before trusting it
+    # Verify lockfile is owned by the current user before trusting its contents
     local lockfile_owner current_uid
-    current_uid=$(id -u)   # FIX #8: capture once into variable, not inside comparison
+    current_uid=$(id -u)
     lockfile_owner=$(stat -c '%u' "$LOCKFILE" 2>/dev/null \
       || stat -f '%u' "$LOCKFILE" 2>/dev/null \
       || echo "")
-    # FIX #3: distinguish stat failure from genuine ownership mismatch
     if [[ -z "$lockfile_owner" ]]; then
-      abort "Could not determine owner of lockfile '$LOCKFILE'.\n\
+      abort "Could not determine ownership of lockfile: $LOCKFILE\n\
         stat failed on this system. Cannot safely verify lockfile ownership."
     fi
     if [[ "$lockfile_owner" != "$current_uid" ]]; then
-      abort "Lockfile is not owned by current user.\n\
-        Owner uid: $lockfile_owner  Current uid: $current_uid\n\
-        This could indicate tampering. Remove and re-run to re-pin:\n\
+      abort "Lockfile is not owned by the current user.\n\
+        Lockfile owner uid: $lockfile_owner  Your uid: $current_uid\n\
+        This may indicate tampering. Remove and re-run to re-pin:\n\
         rm '$LOCKFILE'"
     fi
+
     info "Lockfile found — verifying pinned values..."
     local mismatch=0
-    local pinned_epoch; pinned_epoch=$(jq -r '.signing_epoch' "$LOCKFILE")
+
+    # FIX #4: use // empty consistently so missing keys return "" not "null"
+    local pinned_epoch; pinned_epoch=$(jq -r '.signing_epoch // empty' "$LOCKFILE")
+    local pinned_identity; pinned_identity=$(jq -r '.identity // empty' "$LOCKFILE")
 
     if [[ "$signing_epoch" != "$pinned_epoch" ]]; then
-      warn "Signing epoch MISMATCH  pinned=$pinned_epoch  current=$signing_epoch"
+      warn "Signing epoch MISMATCH"
+      warn "  Pinned:  $pinned_epoch"
+      warn "  Current: $signing_epoch"
+      mismatch=1
+    fi
+
+    # Identity check — catches a different workflow signing the same version tag
+    if [[ -n "$pinned_identity" && "$identity" != "$pinned_identity" ]]; then
+      warn "Signing identity MISMATCH"
+      warn "  Pinned:  $pinned_identity"
+      warn "  Current: $identity"
       mismatch=1
     fi
 
@@ -1052,9 +999,13 @@ check_or_write_lockfile() {
       fi
     done
 
-    [[ "$mismatch" -eq 1 ]] && \
-      abort "Lockfile mismatch — values differ from first install. Investigate before proceeding."
+    [[ "$mismatch" -eq 1 ]] && abort \
+      "Lockfile mismatch — downloaded files differ from the pinned first install.\n\
+        Investigate before proceeding.\n\
+        To re-pin after a confirmed legitimate change:\n\
+          rm '$LOCKFILE' && $0 --repo $REPO --version $VERSION"
     info "Lockfile check passed"
+
   else
     info "First install — writing lockfile..."
     local json="{}"
@@ -1073,35 +1024,42 @@ check_or_write_lockfile() {
     done
     echo "$json" | jq '.' > "$LOCKFILE"
     chmod 600 "$LOCKFILE"
-    warn "Lockfile: $LOCKFILE"
-    warn "Commit to your repo to share pinned trust across your team."
+    warn "Lockfile written: $LOCKFILE"
+    warn "Commit it to your repo to share pinned trust across your team."
   fi
 }
 
-# ── FIX #4 + #5: safe archive extraction ─────────────────────────────────────
-# FIX #5: scan archive for path traversal entries BEFORE extracting anything
-# FIX #4: after extraction, reject symlinks — find with -not -type l
+# ── Archive extraction ────────────────────────────────────────────────────────
+# Scans archive entries for path traversal BEFORE extracting anything.
+# After extraction, rejects symlinks and confirms the binary path stays inside WORKDIR.
 extract_binary() {
   local archive="$1" binary="$2" dest="$3"
 
-  # FIX #5: inspect archive contents for path traversal before touching them
-  local entries
+  # List archive contents first — FIX #2: abort if listing fails (empty entries)
+  local entries=""
   case "$archive" in
     *.tar.gz|*.tgz)   entries=$(tar -tzf "$archive" 2>/dev/null) ;;
     *.tar.bz2)        entries=$(tar -tjf "$archive" 2>/dev/null) ;;
     *.tar.xz)         entries=$(tar -tJf "$archive" 2>/dev/null) ;;
     *.tar.zst)
       command -v zstd &>/dev/null \
-        || abort "zstd not found — required for $archive. Install: apt/brew install zstd"
+        || abort "zstd not found — required to extract $archive.\n        Install: apt/brew install zstd"
       entries=$(tar --zstd -tf "$archive" 2>/dev/null) ;;
     *.zip)
       command -v unzip &>/dev/null \
-        || abort "unzip not found — required for $archive."
+        || abort "unzip not found — required to extract $archive."
       entries=$(unzip -Z1 "$archive" 2>/dev/null) ;;
     *) abort "Unsupported archive format: $archive" ;;
   esac
 
-  # Reject any entry that starts with / or contains .. (including bare ".." directory)
+  # FIX #2: empty entries means the archive could not be read — abort before extraction
+  if [[ -z "$entries" ]]; then
+    abort "Could not list archive contents: $archive\n\
+        The archive may be corrupt, truncated, or in an unexpected format.\n\
+        Path traversal check cannot be performed — refusing to extract."
+  fi
+
+  # Reject path traversal entries — covers absolute paths, .., and bare ..
   while IFS= read -r entry; do
     if [[ "$entry" == /* || \
           "$entry" == ".." || \
@@ -1114,58 +1072,48 @@ extract_binary() {
     fi
   done <<< "$entries"
 
-  # Now safe to extract
-  # Note: --wildcards is GNU tar only and silently fails on macOS BSD tar.
-  # Instead we try exact name first, then full extraction, and locate by find.
+  # Extract — try by exact name first (faster), fall back to full extraction
+  # Note: --wildcards is GNU tar only; omitted for macOS portability
   case "$archive" in
     *.tar.gz|*.tgz)
-      tar -xzf "$archive" "$binary" 2>/dev/null \
-        || tar -xzf "$archive" 2>/dev/null ;;
+      tar -xzf "$archive" "$binary" 2>/dev/null || tar -xzf "$archive" 2>/dev/null ;;
     *.tar.bz2)
-      tar -xjf "$archive" "$binary" 2>/dev/null \
-        || tar -xjf "$archive" 2>/dev/null ;;
+      tar -xjf "$archive" "$binary" 2>/dev/null || tar -xjf "$archive" 2>/dev/null ;;
     *.tar.xz)
-      tar -xJf "$archive" "$binary" 2>/dev/null \
-        || tar -xJf "$archive" 2>/dev/null ;;
+      tar -xJf "$archive" "$binary" 2>/dev/null || tar -xJf "$archive" 2>/dev/null ;;
     *.tar.zst)
-      tar --zstd -xf "$archive" "$binary" 2>/dev/null \
-        || tar --zstd -xf "$archive" 2>/dev/null ;;
+      tar --zstd -xf "$archive" "$binary" 2>/dev/null || tar --zstd -xf "$archive" 2>/dev/null ;;
     *.zip)
-      unzip -q "$archive" "$binary" 2>/dev/null \
-        || unzip -q "$archive" 2>/dev/null ;;
+      unzip -q "$archive" "$binary" 2>/dev/null || unzip -q "$archive" 2>/dev/null ;;
   esac
 
-  # FIX #4: find by exact name, explicitly exclude symlinks (-not -type l)
-  # -type f alone follows symlinks on some systems; -not -type l makes it unambiguous
+  # Locate the binary by exact name — reject symlinks explicitly (-not -type l)
   local found
-  found=$(find . \
-    -name "$binary" \
-    -not -name "$archive" \
-    -type f \
-    -not -type l \
+  found=$(find . -name "$binary" -not -name "$archive" -type f -not -type l \
     2>/dev/null | head -1)
 
   if [[ -z "$found" ]]; then
     abort "Binary '$binary' not found as a regular file after extraction.\n\
-        Archive contents:\n$(echo "$entries" | head -20)\n\
-        Use --binary to specify the correct binary name inside the archive."
+        Archive contents (first 20):\n$(echo "$entries" | head -20)\n\
+        If the binary has a different name inside the archive, use --binary <name>."
   fi
 
-  # FIX #4: confirm resolved path stays within WORKDIR — no symlink escape
+  # Confirm the resolved path stays inside WORKDIR — catches malicious symlinks
   local real_found real_workdir
   real_found=$(cd "$(dirname "$found")" && pwd -P)/$(basename "$found")
   real_workdir=$(pwd -P)
   if [[ "$real_found" != "${real_workdir}/"* ]]; then
     abort "Extracted binary path escapes the working directory.\n\
-        Expected prefix: $real_workdir\n\
-        Resolved path:   $real_found\n\
-        The archive may contain a malicious symlink. Refusing to install."
+        Expected inside: $real_workdir\n\
+        Resolved to:     $real_found\n\
+        The archive may contain a malicious symlink."
   fi
 
   mv "$found" "$dest"
 }
 
-# ── Pattern A ─────────────────────────────────────────────────────────────────
+# ── Pattern handlers ──────────────────────────────────────────────────────────
+
 run_pattern_A() {
   local bundle_filename="${BUNDLE_URL##*/}"
   download_binary       "$BINARY_URL" "$BINARY_FILENAME" "binary"
@@ -1180,7 +1128,6 @@ run_pattern_A() {
     --bundle "$bundle_filename"
 
   local signing_epoch; signing_epoch=$(timestamp_from_bundle "$bundle_filename")
-  # FIX #6: require real epoch before writing lockfile
   require_epoch "$signing_epoch" "$bundle_filename"
   local signing_date; signing_date=$(epoch_to_date "$signing_epoch")
   info "Signed at: $signing_date"
@@ -1193,7 +1140,6 @@ run_pattern_A() {
     "binary" "$binary_sha256" "bundle" "$bundle_sha256"
 }
 
-# ── Pattern B ─────────────────────────────────────────────────────────────────
 run_pattern_B() {
   local checksums_filename="${CHECKSUMS_URL##*/}"
   local pem_filename="${CHECKSUMS_PEM_URL##*/}"
@@ -1213,9 +1159,9 @@ run_pattern_B() {
     --certificate "$pem_filename" \
     --signature   "$sig_filename"
 
-  step "Step 2/2: sha256sum verify binary..."
+  step "Step 2/2: sha256sum verify binary against signed checksums..."
   verify_checksums "$checksums_filename" "$BINARY_FILENAME" \
-    || abort "SHA256 mismatch — binary does not match signed checksums"
+    || abort "SHA256 mismatch — binary does not match the signed checksums file."
   info "sha256sum: binary integrity verified OK"
 
   local signing_epoch; signing_epoch=$(timestamp_from_pem "$pem_filename")
@@ -1232,7 +1178,6 @@ run_pattern_B() {
     "binary" "$binary_sha256" "checksums" "$checksums_sha256" "cert" "$cert_sha256"
 }
 
-# ── Pattern C ─────────────────────────────────────────────────────────────────
 run_pattern_C() {
   local checksums_filename="${CHECKSUMS_URL##*/}"
   local bundle_filename="${CHECKSUMS_BUNDLE_URL##*/}"
@@ -1249,9 +1194,9 @@ run_pattern_C() {
     "https://token.actions.githubusercontent.com" \
     --bundle "$bundle_filename"
 
-  step "Step 2/2: sha256sum verify binary..."
+  step "Step 2/2: sha256sum verify binary against signed checksums..."
   verify_checksums "$checksums_filename" "$BINARY_FILENAME" \
-    || abort "SHA256 mismatch — binary does not match signed checksums"
+    || abort "SHA256 mismatch — binary does not match the signed checksums file."
   info "sha256sum: binary integrity verified OK"
 
   local signing_epoch; signing_epoch=$(timestamp_from_bundle "$bundle_filename")
@@ -1268,23 +1213,21 @@ run_pattern_C() {
     "binary" "$binary_sha256" "checksums" "$checksums_sha256" "bundle" "$bundle_sha256"
 }
 
-# ── Pattern D ─────────────────────────────────────────────────────────────────
 run_pattern_D() {
   local checksums_filename="${CHECKSUMS_URL##*/}"
-  warn "Pattern D: no cosign signing assets found."
-  warn "SHA256 verifies integrity only — NOT provenance (who built it)."
-  warn "Consider asking the project to add cosign/sigstore support."
+  warn "Pattern D: no cosign signing assets found for this release."
+  warn "SHA256 verifies integrity only — provenance (who built it) is NOT verified."
+  warn "Consider opening an issue asking the project to add cosign/sigstore support."
 
-  if [[ -n "$TRUST_CUTOFF_DATE" ]]; then
-    abort "--cutoff requires a signed release with a verifiable timestamp.\n\
-        Pattern D (checksum only) has no signing timestamp."
-  fi
+  [[ -n "$TRUST_CUTOFF_DATE" ]] && abort \
+    "--cutoff requires a signed release with a verifiable timestamp.\n\
+        Pattern D has no signing timestamp — cutoff cannot be enforced."
 
   download_binary       "$BINARY_URL"    "$BINARY_FILENAME"    "binary"
   download_signing_file "$CHECKSUMS_URL" "$checksums_filename" "checksums"
 
   verify_checksums "$checksums_filename" "$BINARY_FILENAME" \
-    || abort "SHA256 mismatch."
+    || abort "SHA256 mismatch — binary does not match the checksums file."
   info "sha256sum: binary integrity verified OK"
 
   local install_epoch; install_epoch=$(date -u +%s)
@@ -1301,7 +1244,7 @@ case "$PATTERN" in
   checksum_certsig) run_pattern_B ;;
   checksum_bundle)  run_pattern_C ;;
   checksum_only)    run_pattern_D ;;
-  *) abort "Unknown pattern: $PATTERN" ;;
+  *) abort "Unknown pattern: $PATTERN — this is a bug, please report it." ;;
 esac
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -1310,14 +1253,11 @@ if [[ "$NO_INSTALL" -eq 1 ]]; then
   exit 0
 fi
 
-mkdir -p "$INSTALL_DIR"
-
 if [[ "$IS_RAW_BINARY" -eq 1 ]]; then
-  # FIX #9: validate BINARY_FILENAME contains no path separators before moving
-  # BINARY_NAME is validated to ^[A-Za-z0-9_.-]+$ but BINARY_FILENAME comes from the URL
+  # Validate filename has no path separators before moving
   [[ "$BINARY_FILENAME" =~ ^[A-Za-z0-9_.,+=-]+$ ]] \
     || abort "Raw binary filename contains unexpected characters: '$BINARY_FILENAME'\n\
-        Expected only alphanumeric, hyphen, underscore, dot, plus, equals."
+        Expected only alphanumeric, hyphens, underscores, dots, plus, equals."
   mv "${WORKDIR}/${BINARY_FILENAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
   extract_binary "$BINARY_FILENAME" "$BINARY_NAME" "${INSTALL_DIR}/${BINARY_NAME}"
@@ -1335,6 +1275,8 @@ echo   "  Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
 echo   "  Pattern:  $PATTERN"
 echo   "  Lockfile: $LOCKFILE"
 echo ""
-echo   "  Ensure ${INSTALL_DIR} is in your PATH:"
-echo   "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo ""
+if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+  echo   "  Add to your PATH:"
+  echo   "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+  echo ""
+fi
